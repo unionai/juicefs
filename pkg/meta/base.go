@@ -2326,6 +2326,12 @@ func (m *baseMeta) GetParents(ctx Context, inode Ino) map[Ino]int {
 	}
 }
 
+// CheckpointStore is engine-specific; engines without a local, consistent
+// snapshot mechanism inherit this refusal.
+func (m *baseMeta) CheckpointStore(ctx Context, dst string) error {
+	return syscall.ENOTSUP
+}
+
 func (m *baseMeta) GetPaths(ctx Context, inode Ino) []string {
 	if inode == RootInode {
 		return []string{"/"}

@@ -34,6 +34,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"sort"
@@ -325,6 +326,57 @@ func (m *redisMeta) doDeleteSlice(id uint64, size uint32) error {
 		return nil
 	})
 	return err
+}
+
+// CheckpointStore persists the dataset via BGSAVE (the server keeps
+// serving), waits for completion, and copies the RDB to dst. Requires the
+// redis server to be co-located (its dump file readable on this host) —
+// the deployment model for embedded per-volume stores.
+func (m *redisMeta) CheckpointStore(ctx Context, dst string) error {
+	if err := m.rdb.BgSave(ctx).Err(); err != nil &&
+		!strings.Contains(strings.ToLower(err.Error()), "in progress") {
+		return err
+	}
+	deadline := time.Now().Add(10 * time.Minute)
+	for {
+		info, err := m.rdb.Info(ctx, "persistence").Result()
+		if err != nil {
+			return err
+		}
+		if strings.Contains(info, "rdb_bgsave_in_progress:0") {
+			if !strings.Contains(info, "rdb_last_bgsave_status:ok") {
+				return fmt.Errorf("BGSAVE finished with non-ok status")
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("BGSAVE did not complete within 10m")
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	dirRes, err := m.rdb.ConfigGet(ctx, "dir").Result()
+	if err != nil {
+		return err
+	}
+	fileRes, err := m.rdb.ConfigGet(ctx, "dbfilename").Result()
+	if err != nil {
+		return err
+	}
+	rdb := filepath.Join(dirRes["dir"], fileRes["dbfilename"])
+	src, err := os.Open(rdb)
+	if err != nil {
+		return fmt.Errorf("open %s (is redis co-located?): %w", rdb, err)
+	}
+	defer src.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	if _, err = io.Copy(out, src); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
 }
 
 func (m *redisMeta) Name() string {

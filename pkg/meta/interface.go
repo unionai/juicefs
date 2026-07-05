@@ -53,6 +53,8 @@ const (
 	InfoV2 = 1005
 	// Clone is a message to clone a file or dir from another.
 	Clone = 1006
+	// Checkpoint is a message to flush + snapshot the metadata store to a local file.
+	Checkpoint = 1009
 	// OpSummary is a message to get tree summary of directories.
 	OpSummary = 1007
 	// CompactPath is a message to trigger compact
@@ -512,6 +514,10 @@ type Meta interface {
 	GetTreeSummary(ctx Context, root *TreeSummary, depth, topN uint8, strict bool, updateProgress func(count uint64, bytes uint64)) syscall.Errno
 	// Clone a file or directory
 	Clone(ctx Context, srcParentIno, srcIno, dstParentIno Ino, dstName string, cmode uint8, cumask uint16, concurrency uint8, count, total *uint64) syscall.Errno
+	// CheckpointStore writes an engine-native, consistent snapshot of the
+	// metadata store to a local file at dst (ENOTSUP for engines/deployments
+	// where no local snapshot is possible).
+	CheckpointStore(ctx Context, dst string) error
 	// GetPaths returns all paths of an inode
 	GetPaths(ctx Context, inode Ino) []string
 	// Check integrity of an absolute path and repair it if asked
