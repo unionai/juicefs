@@ -131,6 +131,20 @@ func (m *kvMeta) Shutdown() error {
 	return m.client.close()
 }
 
+// checkpointableKV is an optional capability of tkv clients that can
+// produce a consistent local snapshot (currently BadgerDB).
+type checkpointableKV interface {
+	checkpointTo(dst string) error
+}
+
+func (m *kvMeta) CheckpointStore(ctx Context, dst string) error {
+	c, ok := m.client.(checkpointableKV)
+	if !ok {
+		return syscall.ENOTSUP
+	}
+	return c.checkpointTo(dst)
+}
+
 func (m *kvMeta) Name() string {
 	return m.client.name()
 }
