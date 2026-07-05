@@ -52,6 +52,13 @@ const (
 	nlocks         = 1024
 	maxSymCacheNum = int32(10000)
 	unknownUsage   = -1
+
+	// Slice-ID layout when Config.SliceDomain is set: 62 usable bits (the
+	// allocator counter is int64 across engines and the dump format), split
+	// into a 20-bit writer-session domain in the high bits and a 42-bit
+	// per-session lane (~4.4T slices) below it.
+	sliceDomainShift = 42
+	sliceDomainBits  = 20
 )
 
 var (
@@ -2138,8 +2145,22 @@ func (m *baseMeta) NewSlice(ctx Context, id *uint64) syscall.Errno {
 		m.freeSlices.next = uint64(v) - sliceIdBatch
 		m.freeSlices.maxid = uint64(v)
 	}
-	*id = m.freeSlices.next
+	raw := m.freeSlices.next
 	m.freeSlices.next++
+	if d := m.conf.SliceDomain; d != 0 {
+		// Compose the writer-session domain into the high bits so clients
+		// sharing a bucket under independent metadata DBs can never collide
+		// on a slice ID (object keys are a pure function of the slice ID).
+		// The raw allocator must stay inside its 42-bit lane; crossing it
+		// would silently walk into another domain's key space, so fail hard
+		// instead — this session has exhausted its ID budget.
+		if raw >= 1<<sliceDomainShift {
+			logger.Errorf("slice allocator exhausted the %d-bit lane of domain %d (raw id %d)", sliceDomainShift, d, raw)
+			return syscall.ENOSPC
+		}
+		raw |= uint64(d) << sliceDomainShift
+	}
+	*id = raw
 	return 0
 }
 
