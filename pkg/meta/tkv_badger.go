@@ -145,6 +145,21 @@ type badgerClient struct {
 	nextid uint64
 }
 
+// checkpointTo streams a consistent Badger backup (all versions from ts 0)
+// to a local file. Badger backups are transactionally consistent snapshots
+// taken while the DB keeps serving.
+func (c *badgerClient) checkpointTo(dst string) error {
+	f, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	if _, err = c.client.Backup(f, 0); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
+}
+
 func (c *badgerClient) name() string {
 	return "badger"
 }
