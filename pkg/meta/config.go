@@ -54,6 +54,16 @@ type Config struct {
 	SortDir            bool
 	FastStatfs         bool
 	NetworkInterfaces  []string // list of network interfaces to use for IP discovery (empty means all)
+
+	// SliceDomain partitions the slice-ID space per writer session. When
+	// non-zero, every allocated slice ID is composed as
+	// domain<<sliceDomainShift | raw. Two clients that share one object
+	// bucket but hold independent metadata DBs (branch forks) can then
+	// never allocate the same slice ID — and, because the object key is a
+	// pure function of the slice ID, never overwrite each other's objects.
+	// Domain 0 is the legacy/unpartitioned space. Assigning unique domains
+	// (one per fork and per retry/remount) is the caller's contract.
+	SliceDomain uint32
 }
 
 func DefaultConf() *Config {
@@ -71,6 +81,9 @@ func (c *Config) SelfCheck() {
 	if c.Heartbeat > time.Minute*10 {
 		logger.Warnf("heartbeat should not be greater than 10 minutes")
 		c.Heartbeat = time.Minute * 10
+	}
+	if c.SliceDomain >= 1<<sliceDomainBits {
+		logger.Fatalf("slice-domain %d out of range (max %d)", c.SliceDomain, uint32(1<<sliceDomainBits)-1)
 	}
 }
 
