@@ -518,6 +518,12 @@ type Meta interface {
 	// metadata store to a local file at dst (ENOTSUP for engines/deployments
 	// where no local snapshot is possible).
 	CheckpointStore(ctx Context, dst string) error
+	// RestoreStore populates a freshly created, EMPTY metadata store from a
+	// checkpoint artifact produced by CheckpointStore on the same engine.
+	// Fails if the store already holds any data (never merges/overwrites).
+	// ENOTSUP for engines whose checkpoint artifact is directly usable as a
+	// store (sqlite: mount the copied file; redis: server loads the RDB).
+	RestoreStore(ctx Context, src string) error
 	// GetPaths returns all paths of an inode
 	GetPaths(ctx Context, inode Ino) []string
 	// Check integrity of an absolute path and repair it if asked
