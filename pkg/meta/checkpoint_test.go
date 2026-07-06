@@ -237,6 +237,59 @@ func TestCheckpointStoreRedisWaitsOutForeignBgSave(t *testing.T) {
 	}
 }
 
+// Badger: a checkpoint restored into a fresh store must reproduce the
+// filesystem and remain writable (fork-from-commit round trip).
+func TestRestoreStoreBadger(t *testing.T) {
+	tmp := t.TempDir()
+	m, err := newKVMeta("badger", filepath.Join(tmp, "src"), testConfig())
+	if err != nil {
+		t.Fatalf("create meta: %s", err)
+	}
+	if err = m.Reset(); err != nil {
+		t.Fatalf("reset: %s", err)
+	}
+	if err = m.Init(testFormat(), true); err != nil {
+		t.Fatalf("init: %s", err)
+	}
+	ctx := Background()
+	var inode Ino
+	var attr Attr
+	if st := m.Create(ctx, RootInode, "f1", 0644, 022, 0, &inode, &attr); st != 0 {
+		t.Fatalf("create file: %s", st)
+	}
+	bak := filepath.Join(tmp, "snap.bak")
+	if err := m.CheckpointStore(ctx, bak); err != nil {
+		t.Fatalf("CheckpointStore: %s", err)
+	}
+
+	m2, err := newKVMeta("badger", filepath.Join(tmp, "dst"), testConfig())
+	if err != nil {
+		t.Fatalf("create dst meta: %s", err)
+	}
+	if err := m2.RestoreStore(ctx, bak); err != nil {
+		t.Fatalf("RestoreStore: %s", err)
+	}
+	if _, err := m2.Load(true); err != nil {
+		t.Fatalf("load restored format: %s", err)
+	}
+	var inode2 Ino
+	if st := m2.Lookup(ctx, RootInode, "f1", &inode2, &attr, false); st != 0 {
+		t.Fatalf("lookup f1 in restored store: %s", st)
+	}
+	if inode2 != inode {
+		t.Fatalf("restored inode mismatch: %d != %d", inode2, inode)
+	}
+	// The restored store must accept new writes (fork continues history).
+	if st := m2.Create(ctx, RootInode, "f2", 0644, 022, 0, &inode2, &attr); st != 0 {
+		t.Fatalf("create in restored store: %s", st)
+	}
+
+	// Never restore into a store that already holds data.
+	if err := m2.RestoreStore(ctx, bak); err == nil {
+		t.Fatalf("RestoreStore into non-empty store must fail")
+	}
+}
+
 // Engines without a local snapshot mechanism must refuse, not misbehave.
 func TestCheckpointStoreUnsupported(t *testing.T) {
 	_ = os.Remove(settingPath)
@@ -252,5 +305,8 @@ func TestCheckpointStoreUnsupported(t *testing.T) {
 	}
 	if err := m.CheckpointStore(Background(), "/tmp/never"); err != syscall.ENOTSUP {
 		t.Fatalf("memkv CheckpointStore: got %v, want ENOTSUP", err)
+	}
+	if err := m.RestoreStore(Background(), "/tmp/never"); err != syscall.ENOTSUP {
+		t.Fatalf("memkv RestoreStore: got %v, want ENOTSUP", err)
 	}
 }

@@ -145,6 +145,28 @@ func (m *kvMeta) CheckpointStore(ctx Context, dst string) error {
 	return c.checkpointTo(dst)
 }
 
+// restorableKV is an optional capability of tkv clients that can populate
+// an empty store from a checkpointTo artifact (currently BadgerDB).
+type restorableKV interface {
+	restoreFrom(src string) error
+}
+
+func (m *kvMeta) RestoreStore(ctx Context, src string) error {
+	c, ok := m.client.(restorableKV)
+	if !ok {
+		return syscall.ENOTSUP
+	}
+	// A restore must never merge into or clobber live metadata. The setting
+	// key is written by format, so its presence means the store is in use;
+	// clients additionally verify the store is completely empty.
+	if v, err := m.get(m.fmtKey("setting")); err != nil {
+		return err
+	} else if v != nil {
+		return fmt.Errorf("destination store is already formatted; restore requires a fresh, empty store")
+	}
+	return c.restoreFrom(src)
+}
+
 func (m *kvMeta) Name() string {
 	return m.client.name()
 }
