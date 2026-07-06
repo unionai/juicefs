@@ -83,6 +83,7 @@ func Main(args []string) error {
 			cmdRmr(),
 			cmdCheckpoint(),
 			cmdCheckpointRestore(),
+			cmdSliceRefs(),
 			cmdSync(),
 			cmdDebug(),
 			cmdClone(),
