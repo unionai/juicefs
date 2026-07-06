@@ -2353,6 +2353,12 @@ func (m *baseMeta) CheckpointStore(ctx Context, dst string) error {
 	return syscall.ENOTSUP
 }
 
+// RestoreStore is engine-specific; engines whose checkpoint artifact is
+// directly usable as a store inherit this refusal.
+func (m *baseMeta) RestoreStore(ctx Context, src string) error {
+	return syscall.ENOTSUP
+}
+
 func (m *baseMeta) GetPaths(ctx Context, inode Ino) []string {
 	if inode == RootInode {
 		return []string{"/"}
