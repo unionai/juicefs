@@ -19,6 +19,7 @@ package cmd
 import (
 	"fmt"
 	"path/filepath"
+	"strings"
 
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/utils"
@@ -30,21 +31,28 @@ func cmdCheckpoint() *cli.Command {
 		Name:      "checkpoint",
 		Action:    checkpoint,
 		Category:  "TOOL",
-		Usage:     "Produce a durable, consistent snapshot of a live mount's metadata store",
-		ArgsUsage: "MOUNTPOINT DST",
+		Usage:     "Produce a durable, consistent snapshot of a metadata store",
+		ArgsUsage: "MOUNTPOINT|META-URL DST",
 		Description: `
-Asks the running client to (1) flush all buffered writes, (2) write an
-engine-native consistent snapshot of the metadata store to DST (a local
-path on the machine running the client), and (3) wait until the writeback
-staging queue has fully drained to object storage. The drain runs after the
-snapshot, so every chunk the snapshot references is durable when this
-command returns 0 — DST can then be published as a branch/commit index.
+With a MOUNTPOINT, asks the running client to (1) flush all buffered
+writes, (2) write an engine-native consistent snapshot of the metadata
+store to DST (a local path on the machine running the client), and (3)
+wait until the writeback staging queue has fully drained to object
+storage. The drain runs after the snapshot, so every chunk the snapshot
+references is durable when this command returns 0 — DST can then be
+published as a branch/commit index.
+
+With a META-URL, snapshots an UNMOUNTED store directly (no drain — there
+is no client, so nothing can be staged). This is how directory-shaped
+stores (BadgerDB) are snapshotted after unmount, where no live client
+holds the store open.
 
 Supported stores: SQLite (VACUUM INTO), Redis (BGSAVE, co-located server),
 BadgerDB (backup stream). Other engines return ENOTSUP.
 
 Examples:
-$ juicefs checkpoint /mnt/jfs /var/lib/vol/checkpoint.db`,
+$ juicefs checkpoint /mnt/jfs /var/lib/vol/checkpoint.db
+$ juicefs checkpoint badger:///var/lib/vol/meta /var/lib/vol/checkpoint.bak`,
 		Flags: []cli.Flag{
 			&cli.UintFlag{
 				Name:  "drain-timeout",
@@ -61,6 +69,19 @@ func checkpoint(ctx *cli.Context) error {
 	dst, err := filepath.Abs(ctx.Args().Get(1))
 	if err != nil {
 		return fmt.Errorf("abs of %q: %s", ctx.Args().Get(1), err)
+	}
+	if strings.Contains(mp, "://") {
+		// Offline: snapshot an unmounted store directly. No drain — with no
+		// running client, nothing can be in the writeback staging queue.
+		m := meta.NewClient(mp, nil)
+		if err := m.CheckpointStore(meta.Background(), dst); err != nil {
+			return fmt.Errorf("checkpoint %s -> %s: %s", mp, dst, err)
+		}
+		if err := m.Shutdown(); err != nil {
+			return fmt.Errorf("close store after checkpoint: %s", err)
+		}
+		logger.Infof("checkpoint written to %s (offline store)", dst)
+		return nil
 	}
 	f, err := openController(mp)
 	if err != nil {
