@@ -344,6 +344,19 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, o
 		var st syscall.Errno
 		go func() {
 			defer close(done)
+			deadline := time.Now().Add(drainTimeout)
+			// Wait out in-flight out-of-band flushes (passthrough staging
+			// reconciles) first: those files' close(2) already returned, so
+			// the snapshot MUST include them, but their writes only become
+			// visible to FlushAll when the reconcile completes.
+			for v.ExternalFlushes() > 0 {
+				if time.Now().After(deadline) {
+					logger.Errorf("checkpoint: timed out waiting for %d in-flight external flush(es)", v.ExternalFlushes())
+					st = syscall.ETIMEDOUT
+					return
+				}
+				time.Sleep(time.Millisecond * 100)
+			}
 			logger.Infof("checkpoint: flushing buffered data")
 			if err := v.FlushAll(""); err != nil {
 				logger.Errorf("checkpoint: flush: %s", err)
@@ -360,7 +373,6 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, o
 				}
 				return
 			}
-			deadline := time.Now().Add(drainTimeout)
 			for {
 				n, err := v.stagingBlocks()
 				if err != nil {
