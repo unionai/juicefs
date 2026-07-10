@@ -330,6 +330,71 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, o
 			}
 		}
 		_, _ = out.Write([]byte{uint8(st)})
+	case meta.Checkpoint:
+		// Flush dirty pages -> snapshot the metadata store -> drain the
+		// writeback staging queue. The drain runs AFTER the snapshot so it
+		// covers exactly the blocks the snapshot references (every slice in
+		// the snapshot was staged before the snapshot was taken); a snapshot
+		// published after a successful drain therefore never references
+		// non-durable chunks.
+		drainTimeout := time.Duration(r.Get32()) * time.Second
+		dst := string(r.Get(int(r.Get32())))
+		done := make(chan struct{})
+		var remain uint64
+		var st syscall.Errno
+		go func() {
+			defer close(done)
+			deadline := time.Now().Add(drainTimeout)
+			// Wait out in-flight out-of-band flushes (passthrough staging
+			// reconciles) first: those files' close(2) already returned, so
+			// the snapshot MUST include them, but their writes only become
+			// visible to FlushAll when the reconcile completes.
+			for v.ExternalFlushes() > 0 {
+				if time.Now().After(deadline) {
+					logger.Errorf("checkpoint: timed out waiting for %d in-flight external flush(es)", v.ExternalFlushes())
+					st = syscall.ETIMEDOUT
+					return
+				}
+				time.Sleep(time.Millisecond * 100)
+			}
+			logger.Infof("checkpoint: flushing buffered data")
+			if err := v.FlushAll(""); err != nil {
+				logger.Errorf("checkpoint: flush: %s", err)
+				st = syscall.EIO
+				return
+			}
+			logger.Infof("checkpoint: snapshotting metadata store to %s", dst)
+			if err := v.Meta.CheckpointStore(ctx, dst); err != nil {
+				logger.Errorf("checkpoint: snapshot store: %s", err)
+				if err == syscall.ENOTSUP {
+					st = syscall.ENOTSUP
+				} else {
+					st = syscall.EIO
+				}
+				return
+			}
+			for {
+				n, err := v.stagingBlocks()
+				if err != nil {
+					logger.Errorf("checkpoint: staging unobservable: %s", err)
+					st = syscall.EIO
+					return
+				}
+				atomic.StoreUint64(&remain, n)
+				if n == 0 {
+					logger.Infof("checkpoint: writeback staging drained; snapshot at %s is durable", dst)
+					return
+				}
+				if time.Now().After(deadline) {
+					logger.Errorf("checkpoint: drain timed out with %d block(s) staged", n)
+					st = syscall.ETIMEDOUT
+					return
+				}
+				time.Sleep(time.Millisecond * 500)
+			}
+		}()
+		writeProgress(&remain, nil, out, done)
+		_, _ = out.Write([]byte{uint8(st)})
 	case meta.Clone:
 		done := make(chan struct{})
 		srcIno := Ino(r.Get64())
@@ -624,4 +689,29 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, o
 		logger.Warnf("unknown message type: %d", cmd)
 		_, _ = out.Write([]byte{byte(syscall.EINVAL & 0xff)})
 	}
+}
+
+// stagingBlocks reports the number of writeback blocks not yet durable in
+// object storage (staged + uploading), read from the in-process metrics
+// registry — the authoritative source behind the .stats file. Zero when
+// writeback is off (no such gauges registered).
+func (v *VFS) stagingBlocks() (uint64, error) {
+	if v.registry == nil {
+		return 0, fmt.Errorf("no metrics registry")
+	}
+	mfs, err := v.registry.Gather()
+	if err != nil {
+		return 0, err
+	}
+	var total float64
+	for _, mf := range mfs {
+		name := mf.GetName()
+		if !strings.Contains(name, "staging_blocks") && !strings.Contains(name, "staging_writing_blocks") {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			total += m.GetGauge().GetValue()
+		}
+	}
+	return uint64(total), nil
 }

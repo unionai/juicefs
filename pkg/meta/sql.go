@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"os"
 	"runtime"
 	"runtime/debug"
 	"slices"
@@ -546,6 +547,22 @@ func newSQLMeta(driver, addr string, conf *Config) (Meta, error) {
 
 func (m *dbMeta) Shutdown() error {
 	return m.db.Close()
+}
+
+// CheckpointStore snapshots a SQLite store to dst via VACUUM INTO — a
+// single-statement, transactionally consistent copy of the live database
+// (WAL folded in), safe under concurrent writers. Server-based SQL engines
+// have no local file to snapshot.
+func (m *dbMeta) CheckpointStore(ctx Context, dst string) error {
+	if m.Name() != "sqlite3" {
+		return syscall.ENOTSUP
+	}
+	// VACUUM INTO refuses to overwrite; the caller owns dst.
+	if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	_, err := m.db.Exec("VACUUM INTO ?", dst)
+	return err
 }
 
 func (m *dbMeta) Name() string {
