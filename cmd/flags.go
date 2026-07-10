@@ -78,6 +78,8 @@ func addCategory(f cli.Flag, cat string) {
 		ff.Category = cat
 	case *cli.Uint64Flag:
 		ff.Category = cat
+	case *cli.UintFlag:
+		ff.Category = cat
 	case *cli.Float64Flag:
 		ff.Category = cat
 	case *cli.DurationFlag:
@@ -328,6 +330,11 @@ func metaFlags() []cli.Flag {
 		&cli.BoolFlag{
 			Name:  "sort-dir",
 			Usage: "sort entries within a directory by name",
+		},
+		&cli.UintFlag{
+			Name:  "slice-domain",
+			Value: 0,
+			Usage: "writer-session domain (1..1048575) composed into the high bits of every allocated slice ID; clients sharing a bucket under independent metadata DBs must each use a unique domain so their object keys can never collide (0 = legacy unpartitioned IDs)",
 		},
 		&cli.BoolFlag{
 			Name:  "fast-statfs",

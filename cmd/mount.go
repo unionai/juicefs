@@ -347,6 +347,7 @@ func getMetaConf(c *cli.Context, mp string, readOnly bool) *meta.Config {
 	conf.Sid, _ = strconv.ParseUint(os.Getenv("_JFS_META_SID"), 10, 64)
 	conf.SortDir = c.Bool("sort-dir")
 	conf.FastStatfs = c.Bool("fast-statfs")
+	conf.SliceDomain = uint32(c.Uint("slice-domain"))
 
 	atimeMode := c.String("atime-mode")
 	if atimeMode != meta.RelAtime && atimeMode != meta.StrictAtime && atimeMode != meta.NoAtime {
