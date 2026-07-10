@@ -22,6 +22,7 @@ package meta
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"strconv"
 	"sync/atomic"
@@ -158,6 +159,35 @@ func (c *badgerClient) checkpointTo(dst string) error {
 		return err
 	}
 	return f.Close()
+}
+
+// restoreFrom loads a checkpointTo backup stream into this store. The DB
+// must be completely empty: Load applies entries at their original commit
+// versions, so loading over existing keys would interleave two histories.
+func (c *badgerClient) restoreFrom(src string) error {
+	empty := true
+	err := c.client.View(func(txn *badger.Txn) error {
+		it := txn.NewIterator(badger.IteratorOptions{PrefetchValues: false})
+		defer it.Close()
+		it.Rewind()
+		empty = !it.Valid()
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if !empty {
+		return fmt.Errorf("destination store is not empty; restore requires a fresh, empty store")
+	}
+	f, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if err = c.client.Load(f, 256); err != nil {
+		return err
+	}
+	return c.client.Sync()
 }
 
 func (c *badgerClient) name() string {
