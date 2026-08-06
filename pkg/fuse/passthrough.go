@@ -176,7 +176,12 @@ func (p *passthroughState) retire(b *ptBacking) {
 		logger.Warnf("passthrough: UnregisterBackingFd(%d): %s", b.backingID, errno)
 	}
 	_ = b.f.Close()
-	_ = os.Remove(b.path)
+	if err := os.Remove(b.path); err != nil && !os.IsNotExist(err) {
+		// Data is already safely in JuiceFS at this point, so this is a
+		// leaked-disk-space concern, not a durability one — but a silently
+		// swallowed error here means nothing points an operator at the file.
+		logger.Warnf("passthrough: remove staging %s: %s", b.path, err)
+	}
 }
 
 func isWriteOpen(flags uint32) bool {
@@ -518,5 +523,29 @@ func (p *passthroughState) drain(timeout time.Duration) bool {
 			return false
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// reconcileAll proactively reconciles every currently-tracked passthrough
+// open. reconcile() normally only runs from the RELEASE handler as each
+// open closes, but a force or lazy unmount can tear down the FUSE
+// connection without ever delivering RELEASE for opens that were still
+// live — some of which may have data whose close(2) already returned
+// successfully to the application. Without this, that data would simply be
+// abandoned in a staging file nothing ever looks at again. Call this from
+// the shutdown path BEFORE the connection is torn down, while backing
+// registrations and InodeNotify are still valid.
+func (p *passthroughState) reconcileAll(ctx vfs.Context, v *vfs.VFS) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	fhs := make([]uint64, 0, len(p.files))
+	for fh := range p.files {
+		fhs = append(fhs, fh)
+	}
+	p.mu.Unlock()
+	for _, fh := range fhs {
+		p.reconcile(ctx, v, fh)
 	}
 }

@@ -135,3 +135,22 @@ func TestWaitInodeNilStateReturnsTrue(t *testing.T) {
 		t.Fatalf("nil state should return true (no passthrough in use)")
 	}
 }
+
+// reconcileAll on a nil state (passthrough disabled) must be a no-op: the
+// shutdown path calls this unconditionally regardless of whether passthrough
+// is in use.
+func TestReconcileAllNilStateNoop(t *testing.T) {
+	var p *passthroughState
+	p.reconcileAll(nil, nil) // must not panic
+}
+
+// reconcileAll with nothing tracked must return without touching the (nil)
+// server — a regression test for the fh-snapshot loop: it must only iterate
+// entries actually present in p.files, not e.g. loop on a zero value.
+func TestReconcileAllEmptyNoop(t *testing.T) {
+	p := &passthroughState{files: make(map[uint64]*ptFile), busy: make(map[Ino]int)}
+	p.reconcileAll(nil, nil) // must not panic despite nil ctx/server/vfs
+	if len(p.files) != 0 || len(p.busy) != 0 {
+		t.Fatalf("reconcileAll on an empty state mutated files/busy: %v %v", p.files, p.busy)
+	}
+}

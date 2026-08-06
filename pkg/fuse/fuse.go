@@ -679,3 +679,15 @@ func DrainPassthrough(timeout time.Duration) bool {
 	}
 	return ptState.drain(timeout)
 }
+
+// ReconcileAllPassthrough proactively reconciles every currently-tracked
+// passthrough open (see passthroughState.reconcileAll). Call this during
+// shutdown before the FUSE connection is torn down: a force or lazy unmount
+// may never deliver RELEASE for opens that are still live, and without this
+// their staging data would simply be abandoned.
+func ReconcileAllPassthrough(ctx vfs.Context, v *vfs.VFS) {
+	if ptState == nil {
+		return
+	}
+	ptState.reconcileAll(ctx, v)
+}
