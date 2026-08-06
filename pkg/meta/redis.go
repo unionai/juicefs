@@ -333,26 +333,8 @@ func (m *redisMeta) doDeleteSlice(id uint64, size uint32) error {
 // redis server to be co-located (its dump file readable on this host) —
 // the deployment model for embedded per-volume stores.
 func (m *redisMeta) CheckpointStore(ctx Context, dst string) error {
-	if err := m.rdb.BgSave(ctx).Err(); err != nil &&
-		!strings.Contains(strings.ToLower(err.Error()), "in progress") {
+	if err := m.bgSaveFresh(ctx); err != nil {
 		return err
-	}
-	deadline := time.Now().Add(10 * time.Minute)
-	for {
-		info, err := m.rdb.Info(ctx, "persistence").Result()
-		if err != nil {
-			return err
-		}
-		if strings.Contains(info, "rdb_bgsave_in_progress:0") {
-			if !strings.Contains(info, "rdb_last_bgsave_status:ok") {
-				return fmt.Errorf("BGSAVE finished with non-ok status")
-			}
-			break
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("BGSAVE did not complete within 10m")
-		}
-		time.Sleep(200 * time.Millisecond)
 	}
 	dirRes, err := m.rdb.ConfigGet(ctx, "dir").Result()
 	if err != nil {
@@ -377,6 +359,57 @@ func (m *redisMeta) CheckpointStore(ctx Context, dst string) error {
 		return err
 	}
 	return out.Close()
+}
+
+// bgSaveFresh triggers a BGSAVE that is guaranteed to have STARTED at or
+// after this call, and waits for it to finish. BGSAVE forks a point-in-time
+// snapshot at the moment it starts, not when it completes — so if a save is
+// already running when we ask (Redis's own periodic save, or a racing
+// checkpoint request from elsewhere), naively waiting for THAT one to
+// finish and trusting its result would silently return a snapshot missing
+// every write made between its start and this call, violating checkpoint's
+// point-in-time-as-of-now contract. Wait out any foreign save first, then
+// issue and wait for our own; retry a bounded number of times against the
+// rare case where a new foreign save wins the race to start first.
+func (m *redisMeta) bgSaveFresh(ctx Context) error {
+	const maxAttempts = 5
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if err := m.waitBgSaveDone(ctx, 10*time.Minute); err != nil {
+			return err
+		}
+		err := m.rdb.BgSave(ctx).Err()
+		if err == nil {
+			return m.waitBgSaveDone(ctx, 10*time.Minute)
+		}
+		if !strings.Contains(strings.ToLower(err.Error()), "in progress") {
+			return err
+		}
+		// Lost the race to a foreign save that started between our wait and
+		// our BgSave call; loop to wait it out and try triggering our own.
+	}
+	return fmt.Errorf("BGSAVE: could not start a fresh save after %d attempts (repeatedly raced a foreign save)", maxAttempts)
+}
+
+// waitBgSaveDone polls until no BGSAVE is in progress, or returns an error
+// on failure or timeout.
+func (m *redisMeta) waitBgSaveDone(ctx Context, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		info, err := m.rdb.Info(ctx, "persistence").Result()
+		if err != nil {
+			return err
+		}
+		if strings.Contains(info, "rdb_bgsave_in_progress:0") {
+			if !strings.Contains(info, "rdb_last_bgsave_status:ok") {
+				return fmt.Errorf("BGSAVE finished with non-ok status")
+			}
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("BGSAVE did not complete within %s", timeout)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
 }
 
 func (m *redisMeta) Name() string {
