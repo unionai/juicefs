@@ -200,14 +200,21 @@ func TestCheckpointStoreRedisWaitsOutForeignBgSave(t *testing.T) {
 		t.Fatalf("init: %s", err)
 	}
 	ctx := Background()
-	for i := 0; i < 200; i++ {
+	for i := 0; i < 300; i++ {
 		if err := rm.rdb.Set(ctx, "ckpt-test-key-"+strconv.Itoa(i), "v", 0).Err(); err != nil {
 			t.Fatalf("seed key: %s", err)
 		}
 	}
-	const delayUS = "3000" // 3ms/key * 200 keys ~= 600ms per save
-	if err := rm.rdb.ConfigSet(ctx, "rdb-key-save-delay", delayUS).Err(); err != nil {
+	// A large single-save duration keeps ordinary scheduling/CPU jitter (tens
+	// to low hundreds of ms) a small fraction of it, so the 1.4x threshold
+	// below cleanly separates "waited out + ran its own" (~2x) from "just
+	// piggybacked" (~1x) even under load from other tests in this package.
+	const delayUS = "6000" // 6ms/key * 300 keys ~= 1.8s per save
+	if err := rm.rdb.ConfigSet(ctx, "rdb-key-save-delay", "0").Err(); err != nil {
 		t.Skipf("rdb-key-save-delay not supported by this redis build: %s", err)
+	}
+	if err := rm.rdb.ConfigSet(ctx, "rdb-key-save-delay", delayUS).Err(); err != nil {
+		t.Fatalf("set rdb-key-save-delay: %s", err)
 	}
 	defer rm.rdb.ConfigSet(ctx, "rdb-key-save-delay", "0")
 
@@ -230,7 +237,7 @@ func TestCheckpointStoreRedisWaitsOutForeignBgSave(t *testing.T) {
 	}
 	racedDuration := time.Since(racedStart)
 
-	if racedDuration < singleSave*3/2 {
+	if racedDuration < singleSave*7/5 {
 		t.Fatalf("raced checkpoint (%s) did not wait out the foreign save and run its own "+
 			"(single save took %s) — it likely piggybacked on the foreign save's stale result",
 			racedDuration, singleSave)
