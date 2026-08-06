@@ -261,8 +261,13 @@ func (fs *fileSystem) Open(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.Op
 	// If this inode has a passthrough write still reconciling, wait for it so
 	// this open sees the file's real (post-reconcile) size and content rather
 	// than the transient empty state — otherwise a write here would race the
-	// reconcile's copy and lose data.
-	fs.pt.waitInode(Ino(in.NodeId))
+	// reconcile's copy and lose data. A timeout means the reconcile is
+	// abnormally slow (or stuck); proceeding anyway would silently serve
+	// stale/empty content as if it were authoritative, so fail the open
+	// instead of guessing — the caller can retry.
+	if !fs.pt.waitInode(Ino(in.NodeId), waitInodeTimeout) {
+		return fuse.Status(syscall.EAGAIN)
+	}
 	entry, fh, err := fs.v.Open(ctx, Ino(in.NodeId), in.Flags)
 	if err != 0 {
 		return fuse.Status(err)
@@ -673,4 +678,16 @@ func DrainPassthrough(timeout time.Duration) bool {
 		return true
 	}
 	return ptState.drain(timeout)
+}
+
+// ReconcileAllPassthrough proactively reconciles every currently-tracked
+// passthrough open (see passthroughState.reconcileAll). Call this during
+// shutdown before the FUSE connection is torn down: a force or lazy unmount
+// may never deliver RELEASE for opens that are still live, and without this
+// their staging data would simply be abandoned.
+func ReconcileAllPassthrough(ctx vfs.Context, v *vfs.VFS) {
+	if ptState == nil {
+		return
+	}
+	ptState.reconcileAll(ctx, v)
 }

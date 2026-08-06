@@ -963,6 +963,15 @@ func installHandler(m meta.Meta, mp string, v *vfs.VFS, blob object.ObjectStorag
 					continue
 				}
 			}
+			// A passthrough open whose RELEASE hasn't been delivered yet has
+			// data sitting only in a local staging file — some of it possibly
+			// behind a close(2) that already returned success. The force
+			// unmount below can tear down the FUSE connection without ever
+			// delivering that RELEASE, which would otherwise abandon the
+			// data. Reconcile everything still tracked now, while the mount
+			// and backing registrations are still valid; the timeout
+			// goroutine below is an unconditional backstop if this runs long.
+			fuse.ReconcileAllPassthrough(vfs.NewLogContext(meta.Background()), v)
 			go func() {
 				time.Sleep(time.Second * 30)
 				// The umount is stuck, but a passthrough reconcile may still

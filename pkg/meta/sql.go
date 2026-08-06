@@ -557,12 +557,24 @@ func (m *dbMeta) CheckpointStore(ctx Context, dst string) error {
 	if m.Name() != "sqlite3" {
 		return syscall.ENOTSUP
 	}
-	// VACUUM INTO refuses to overwrite; the caller owns dst.
-	if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
+	// VACUUM INTO writes its destination directly and is not itself atomic:
+	// an interrupted run (process killed, disk full) leaves a missing or
+	// truncated/corrupt file at whatever path it targets. Write to a temp
+	// path next to dst (same directory, so the publish rename below is a
+	// same-filesystem atomic rename) and only publish at dst once VACUUM
+	// INTO has fully succeeded — a failed or interrupted checkpoint must
+	// never destroy a prior good snapshot that happened to live at dst.
+	tmp := fmt.Sprintf("%s.tmp-%d", dst, time.Now().UnixNano())
+	_ = os.Remove(tmp) // best-effort: clear a stale leftover from a prior failed attempt
+	if _, err := m.db.Exec("VACUUM INTO ?", tmp); err != nil {
+		_ = os.Remove(tmp)
 		return err
 	}
-	_, err := m.db.Exec("VACUUM INTO ?", dst)
-	return err
+	if err := os.Rename(tmp, dst); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 func (m *dbMeta) Name() string {
