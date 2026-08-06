@@ -346,17 +346,24 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, o
 			defer close(done)
 			deadline := time.Now().Add(drainTimeout)
 			// Wait out in-flight out-of-band flushes (passthrough staging
-			// reconciles) first: those files' close(2) already returned, so
-			// the snapshot MUST include them, but their writes only become
-			// visible to FlushAll when the reconcile completes.
-			for v.ExternalFlushes() > 0 {
-				if time.Now().After(deadline) {
-					logger.Errorf("checkpoint: timed out waiting for %d in-flight external flush(es)", v.ExternalFlushes())
-					st = syscall.ETIMEDOUT
-					return
-				}
-				time.Sleep(time.Millisecond * 100)
+			// reconciles) first, AND block new ones from starting until the
+			// snapshot below is taken: those files' close(2) already
+			// returned, so the snapshot MUST include them, but their writes
+			// only become visible to FlushAll when the reconcile completes.
+			// A plain "poll until ExternalFlushes()==0" is a TOCTOU — a new
+			// reconcile could start in the gap between the poll succeeding
+			// and CheckpointStore actually running, and its write would land
+			// either just before or just after the snapshot depending on
+			// scheduling, silently violating the read-your-writes contract
+			// for a close(2) that already returned. QuiesceExternalFlushes
+			// closes that gap by refusing new admissions before it starts
+			// waiting, same as passthroughState.drain() does for handover.
+			if !v.QuiesceExternalFlushes(deadline) {
+				logger.Errorf("checkpoint: timed out waiting for in-flight external flush(es)")
+				st = syscall.ETIMEDOUT
+				return
 			}
+			defer v.EndQuiesceExternalFlushes()
 			logger.Infof("checkpoint: flushing buffered data")
 			if err := v.FlushAll(""); err != nil {
 				logger.Errorf("checkpoint: flush: %s", err)

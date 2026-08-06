@@ -70,6 +70,10 @@ type passthroughState struct {
 	warnOne  sync.Once
 }
 
+// waitInodeTimeout bounds how long an Open waits for a same-inode passthrough
+// reconcile to finish before refusing the open outright (see waitInode).
+const waitInodeTimeout = 30 * time.Second
+
 // ptBacking is one registered kernel backing: a staging file plus the
 // backing ID the kernel handed back for it. It outlives individual opens.
 type ptBacking struct {
@@ -255,27 +259,33 @@ func (p *passthroughState) releaseBusyLocked(ino Ino) {
 }
 
 // waitInode blocks (bounded) until ino has no passthrough open or in-flight
-// reconcile. Called at the start of Open so a reopen of a file this session
-// just wrote via passthrough observes the reconciled state: until reconcile
-// lands, the metadata size still reads 0 and a new write (passthrough OR
-// daemon) would race the reconcile's linear copy and silently lose data.
-// After the wait the file's size is authoritative, so tryOpen's emptyAtOpen
-// gate correctly sends the reopen down the daemon path.
-func (p *passthroughState) waitInode(ino Ino) {
+// reconcile, returning true once it does. Called at the start of Open so a
+// reopen of a file this session just wrote via passthrough observes the
+// reconciled state: until reconcile lands, the metadata size still reads 0
+// and a new write (passthrough OR daemon) would race the reconcile's linear
+// copy and silently lose data. After a successful wait the file's size is
+// authoritative, so tryOpen's emptyAtOpen gate correctly sends the reopen
+// down the daemon path.
+//
+// On timeout it returns false. The metadata size may still be stale (an
+// in-flight reconcile hasn't landed it), so the caller MUST NOT treat it as
+// authoritative — proceeding as if the wait had succeeded would silently
+// serve stale/empty content as if it were the real, reconciled file.
+func (p *passthroughState) waitInode(ino Ino, timeout time.Duration) bool {
 	if p == nil {
-		return
+		return true
 	}
-	deadline := time.Now().Add(30 * time.Second)
+	deadline := time.Now().Add(timeout)
 	for {
 		p.mu.Lock()
 		busy := p.busy[ino] > 0
 		p.mu.Unlock()
 		if !busy {
-			return
+			return true
 		}
 		if time.Now().After(deadline) {
-			logger.Warnf("passthrough: waited 30s for in-flight reconcile of ino %d; proceeding", ino)
-			return
+			logger.Warnf("passthrough: waited %s for in-flight reconcile of ino %d; refusing this open rather than risk stale content", timeout, ino)
+			return false
 		}
 		time.Sleep(2 * time.Millisecond)
 	}

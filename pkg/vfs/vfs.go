@@ -1249,19 +1249,76 @@ type VFS struct {
 	// can be snapshotted mid-copy. See ExternalFlushes.
 	externalFlushes int64
 
+	// extFlushMu/extFlushCond/quiescing gate new external flushes for a
+	// consistency point. Checking ExternalFlushes()==0 alone is a TOCTOU: a
+	// new flow can start in the gap between that check returning and the
+	// snapshot actually being taken. QuiesceExternalFlushes sets quiescing
+	// BEFORE waiting, so nothing can join after the wait starts — the count
+	// can only fall to zero and stay there, the same pause-then-wait shape
+	// passthroughState.drain() uses for SIGHUP handover.
+	extFlushMu   sync.Mutex
+	extFlushCond *sync.Cond
+	quiescing    bool
+
 	registry *prometheus.Registry
 }
 
 // BeginExternalFlush marks an out-of-band write flow (such as a passthrough
 // staging-file reconcile) as in flight. Call before the flow's first Write so
 // a concurrent consistency point cannot observe zero while data is pending.
-func (v *VFS) BeginExternalFlush() { atomic.AddInt64(&v.externalFlushes, 1) }
+// Blocks while a consistency point is quiescing external flushes, so a new
+// flow cannot start after that point has already decided none were in
+// flight.
+func (v *VFS) BeginExternalFlush() {
+	v.extFlushMu.Lock()
+	for v.quiescing {
+		v.extFlushCond.Wait()
+	}
+	atomic.AddInt64(&v.externalFlushes, 1)
+	v.extFlushMu.Unlock()
+}
 
 // EndExternalFlush marks the flow complete (its writes flushed or failed).
-func (v *VFS) EndExternalFlush() { atomic.AddInt64(&v.externalFlushes, -1) }
+func (v *VFS) EndExternalFlush() {
+	v.extFlushMu.Lock()
+	atomic.AddInt64(&v.externalFlushes, -1)
+	v.extFlushCond.Broadcast()
+	v.extFlushMu.Unlock()
+}
 
 // ExternalFlushes reports the number of out-of-band write flows in flight.
 func (v *VFS) ExternalFlushes() int64 { return atomic.LoadInt64(&v.externalFlushes) }
+
+// QuiesceExternalFlushes blocks new external flows (BeginExternalFlush
+// callers wait) and then waits for any already in flight to finish, up to
+// deadline. Returns true once none are in flight — from that point until
+// EndQuiesceExternalFlushes is called, the count is guaranteed to stay zero,
+// making it safe to take a consistency snapshot. Returns false on timeout,
+// having already reopened the gate so blocked callers aren't stuck.
+func (v *VFS) QuiesceExternalFlushes(deadline time.Time) bool {
+	v.extFlushMu.Lock()
+	v.quiescing = true
+	v.extFlushMu.Unlock()
+	for {
+		if atomic.LoadInt64(&v.externalFlushes) == 0 {
+			return true
+		}
+		if time.Now().After(deadline) {
+			v.EndQuiesceExternalFlushes()
+			return false
+		}
+		time.Sleep(time.Millisecond * 100)
+	}
+}
+
+// EndQuiesceExternalFlushes reopens the gate closed by QuiesceExternalFlushes,
+// releasing any BeginExternalFlush callers that were blocked waiting.
+func (v *VFS) EndQuiesceExternalFlushes() {
+	v.extFlushMu.Lock()
+	v.quiescing = false
+	v.extFlushMu.Unlock()
+	v.extFlushCond.Broadcast()
+}
 
 func NewVFS(conf *Config, m meta.Meta, store chunk.ChunkStore, registerer prometheus.Registerer, registry *prometheus.Registry) *VFS {
 	reader := NewDataReader(conf, m, store)
@@ -1280,6 +1337,7 @@ func NewVFS(conf *Config, m meta.Meta, store chunk.ChunkStore, registerer promet
 		nextfh:      1,
 		registry:    registry,
 	}
+	v.extFlushCond = sync.NewCond(&v.extFlushMu)
 
 	n := getInternalNode(ConfigInode)
 	v.Conf.Format.RemoveSecret()

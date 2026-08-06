@@ -261,8 +261,13 @@ func (fs *fileSystem) Open(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.Op
 	// If this inode has a passthrough write still reconciling, wait for it so
 	// this open sees the file's real (post-reconcile) size and content rather
 	// than the transient empty state — otherwise a write here would race the
-	// reconcile's copy and lose data.
-	fs.pt.waitInode(Ino(in.NodeId))
+	// reconcile's copy and lose data. A timeout means the reconcile is
+	// abnormally slow (or stuck); proceeding anyway would silently serve
+	// stale/empty content as if it were authoritative, so fail the open
+	// instead of guessing — the caller can retry.
+	if !fs.pt.waitInode(Ino(in.NodeId), waitInodeTimeout) {
+		return fuse.Status(syscall.EAGAIN)
+	}
 	entry, fh, err := fs.v.Open(ctx, Ino(in.NodeId), in.Flags)
 	if err != 0 {
 		return fuse.Status(err)
