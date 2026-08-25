@@ -21,6 +21,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -68,7 +69,29 @@ type passthroughState struct {
 	disabled bool               // registration failed with a permanent error; stop trying
 	paused   bool               // draining for handover/shutdown; refuse new passthrough opens
 	warnOne  sync.Once
+
+	// Staging headroom. Passthrough writes land in a real file on this
+	// filesystem, so an open granted without room for the data either fails
+	// mid-write with ENOSPC or — when staging is a memory-backed emptyDir —
+	// pushes the pod's memory cgroup into reclaim, which degrades every
+	// subsequent staging write and reconcile. Cheaper to decline the open and
+	// take the daemon path, which streams into the write-back cache instead.
+	minFree      uint64
+	freeCheckAt  time.Time
+	freeOK       bool
+	lowSpaceWarn sync.Once
 }
+
+// defaultMinStagingFree is the free space a staging filesystem must have for
+// passthrough to be granted. Deliberately coarse: the file's eventual size is
+// unknown at open, so this is a floor that keeps us away from a full staging
+// area rather than a per-file reservation.
+const defaultMinStagingFree = 256 << 20
+
+// stagingFreeTTL caps how often we statfs the staging dir. Open is a hot path
+// (a small-file loop can issue thousands per second); the free-space figure
+// only needs to be approximately fresh.
+const stagingFreeTTL = 200 * time.Millisecond
 
 // waitInodeTimeout bounds how long an Open waits for a same-inode passthrough
 // reconcile to finish before refusing the open outright (see waitInode).
@@ -111,12 +134,63 @@ func newPassthroughState(server *fuse.Server, dir string) *passthroughState {
 		logger.Warnf("passthrough: per-process staging dir under %s: %s; using base", base, err)
 		sub = base
 	}
-	return &passthroughState{
-		server: server,
-		dir:    sub,
-		files:  make(map[uint64]*ptFile),
-		busy:   make(map[Ino]int),
+	minFree := uint64(defaultMinStagingFree)
+	if v := os.Getenv("JUICEFS_PASSTHROUGH_MIN_FREE"); v != "" {
+		if n, err := strconv.ParseUint(v, 10, 64); err == nil {
+			minFree = n
+		} else {
+			logger.Warnf("passthrough: ignoring JUICEFS_PASSTHROUGH_MIN_FREE=%q: %s", v, err)
+		}
 	}
+	return &passthroughState{
+		server:  server,
+		dir:     sub,
+		files:   make(map[uint64]*ptFile),
+		busy:    make(map[Ino]int),
+		minFree: minFree,
+	}
+}
+
+// hasStagingHeadroom reports whether the staging filesystem has enough free
+// space to be worth granting passthrough. Result is cached for stagingFreeTTL
+// so a small-file loop does not statfs on every open. A statfs error is
+// treated as "no headroom": we cannot confirm room, and the daemon path is
+// always correct, just slower.
+func (p *passthroughState) hasStagingHeadroom() bool {
+	if p.minFree == 0 {
+		return true
+	}
+	p.mu.Lock()
+	if time.Since(p.freeCheckAt) < stagingFreeTTL {
+		ok := p.freeOK
+		p.mu.Unlock()
+		return ok
+	}
+	p.mu.Unlock()
+
+	var st syscall.Statfs_t
+	ok := false
+	var free uint64
+	if err := syscall.Statfs(p.dir, &st); err != nil {
+		logger.Warnf("passthrough: statfs staging %s: %s; treating as no headroom", p.dir, err)
+	} else {
+		free = st.Bavail * uint64(st.Bsize)
+		ok = free >= p.minFree
+	}
+
+	p.mu.Lock()
+	p.freeCheckAt = time.Now()
+	p.freeOK = ok
+	p.mu.Unlock()
+	if !ok && free > 0 {
+		p.lowSpaceWarn.Do(func() {
+			logger.Warnf("passthrough: staging %s has %d bytes free, below the %d-byte floor; "+
+				"falling back to the daemon write path (raise JUICEFS_PASSTHROUGH_MIN_FREE, "+
+				"enlarge the staging volume, or point JUICEFS_PASSTHROUGH_DIR at a larger filesystem)",
+				p.dir, free, p.minFree)
+		})
+	}
+	return ok
 }
 
 // checkout registers a fresh backing for a new passthrough open. Always a new
@@ -234,6 +308,14 @@ func (p *passthroughState) tryOpen(ino Ino, fh uint64, flags uint32, emptyAtOpen
 		p.mu.Lock()
 		p.releaseBusyLocked(ino)
 		p.mu.Unlock()
+	}
+
+	// Check headroom after the busy reservation (so the cheap latches win) but
+	// before registering a backing: granting passthrough onto a full staging
+	// filesystem is strictly worse than not granting it.
+	if !p.hasStagingHeadroom() {
+		release()
+		return 0, false
 	}
 
 	if !p.server.SupportsPassthrough() {
