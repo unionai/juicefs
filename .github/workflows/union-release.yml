@@ -81,7 +81,6 @@ jobs:
           go build \
             -tags "$UNION_BUILD_TAGS" \
             -ldflags "-s -w \
-              -X github.com/juicedata/juicefs/pkg/version.version=${{ steps.v.outputs.version }} \
               -X github.com/juicedata/juicefs/pkg/version.revision=$(git rev-parse --short HEAD) \
               -X github.com/juicedata/juicefs/pkg/version.revisionDate=$(git log -1 --pretty=format:%cd --date=short)" \
             -o juicefs .
@@ -95,7 +94,13 @@ jobs:
             linux-amd64) file juicefs | grep -q "x86-64" ;;
             linux-arm64) file juicefs | grep -q "aarch64" ;;
           esac
+          # pkg/version has no ldflag-settable version string (it is a struct
+          # literal), so the tag never appears here — the commit does, and the
+          # linker ignores an -X for a symbol that does not exist without
+          # complaining. Assert the revision landed, or a silently-dead ldflag
+          # ships binaries that cannot be traced back to a commit.
           ./juicefs version
+          ./juicefs version | grep -q "$(git rev-parse --short HEAD)"
           # Union-only surface: if these are missing the wrong branch got built.
           ./juicefs mount --help 2>&1 | grep -q -- "--slice-domain"
           ./juicefs checkpoint --help >/dev/null 2>&1
