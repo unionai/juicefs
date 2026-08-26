@@ -88,26 +88,40 @@ jobs:
       - name: Verify the binary is what we think it is
         run: |
           set -euo pipefail
-          file juicefs
-          # A cross-compile slip would silently ship an amd64 binary as arm64.
+          # NOTE: never `producer | grep -q` under `set -o pipefail`. grep -q
+          # exits at the first match, the producer dies on EPIPE, and pipefail
+          # reports that 141 as the pipeline's status — so the check fails
+          # precisely *because* it matched. Capture first, then match.
+          info=$(file juicefs)
+          echo "$info"
           case "${{ matrix.platform }}" in
-            linux-amd64) file juicefs | grep -q "x86-64" ;;
-            linux-arm64) file juicefs | grep -q "aarch64" ;;
+            # A cross-compile slip would otherwise ship an amd64 binary under
+            # an arm64 asset name, invisible until someone runs it.
+            linux-amd64) echo "$info" | grep "x86-64" > /dev/null ;;
+            linux-arm64) echo "$info" | grep "aarch64" > /dev/null ;;
           esac
+
           # pkg/version has no ldflag-settable version string (it is a struct
-          # literal), so the tag never appears here — the commit does, and the
-          # linker ignores an -X for a symbol that does not exist without
-          # complaining. Assert the revision landed, or a silently-dead ldflag
-          # ships binaries that cannot be traced back to a commit.
-          ./juicefs version
-          ./juicefs version | grep -q "$(git rev-parse --short HEAD)"
-          # Union-only surface: if these are missing the wrong branch got built.
-          ./juicefs mount --help 2>&1 | grep -q -- "--slice-domain"
-          ./juicefs checkpoint --help >/dev/null 2>&1
-          # badger is the flyteplugins-union default metadata store; a build
-          # that dropped it still runs, and only fails later on a user's node
-          # when a volume will not mount. Fail the release here instead.
-          strings juicefs | grep -q "dgraph-io/badger"
+          # literal), so the tag never appears here — the commit does. The
+          # linker ignores an -X naming a symbol that does not exist, without
+          # complaining, so assert the revision actually landed; otherwise a
+          # dead ldflag ships binaries that cannot be traced to a commit.
+          ver=$(./juicefs version)
+          echo "$ver"
+          echo "$ver" | grep "$(git rev-parse --short HEAD)" > /dev/null
+
+          # Union-only surface: absent means the wrong branch got built.
+          mount_help=$(./juicefs mount --help 2>&1)
+          echo "$mount_help" | grep -- "--slice-domain" > /dev/null
+          ./juicefs checkpoint --help > /dev/null 2>&1
+
+          # badger is flyteplugins-union's default metadata store and exists
+          # only in this fork. A build that dropped it still runs and only
+          # fails later, on a user's node, when a volume will not mount.
+          strings juicefs > /tmp/juicefs.strings
+          grep "dgraph-io/badger" /tmp/juicefs.strings > /dev/null
+
+          echo "verified: $(basename juicefs) is a union ${{ matrix.platform }} build with badger"
 
       - name: Package
         run: |
