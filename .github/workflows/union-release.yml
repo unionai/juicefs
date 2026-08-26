@@ -1,0 +1,138 @@
+# Builds the linux binaries Union ships and attaches them to a v*-union.* tag.
+#
+# Replaces the hand-run `go build` the union.1/union.2 releases were cut with
+# (see UNION-DELTA.md "Releases"), which is why those tags carry a linux-amd64
+# asset and nothing else. arm64 matters now that flyteplugins-union defaults
+# new volumes to the badger store: badger only exists in this fork, so on a
+# platform with no fork asset `bundle_juicefs.py` falls back to upstream
+# juicefs, and a task landing on a Graviton node would create a volume its own
+# bundled client cannot serve.
+#
+# Native runners per arch rather than cross-compilation: the build needs
+# CGO_ENABLED=1 (go-sqlite3 — `nosqlite` is deliberately NOT in the tag list
+# below), and a native aarch64 toolchain avoids maintaining a cross-gcc setup.
+# GitHub's arm64 runners are free for public repos, which this fork is.
+name: union release
+
+on:
+  push:
+    tags:
+      # union tags only — never upstream tags synced onto `main`.
+      - "v*-union.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing v*-union.* tag to build and attach assets to"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  # Keep in lockstep with UNION-DELTA.md and the release notes. Backends kept:
+  # s3, gs, wasb, sqlite, redis, badger. `nobadger` is deliberately absent —
+  # badger is the flyteplugins-union default metadata store.
+  UNION_BUILD_TAGS: nogateway,nowebdav,nocos,nobos,nohdfs,noibmcos,noobs,nooss,noqingstor,nosftp,noswift,noufile,nob2,nonfs,nodragonfly,nomysql,nopg,notikv,noetcd,nocifs,nostorj,noqiniu,notos,noks3
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-amd64
+            runner: ubuntu-22.04
+          - platform: linux-arm64
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          # version.revision/revisionDate are derived from git below.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Resolve version
+        id: v
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag || github.ref_name }}"
+          case "$tag" in
+            v*-union.*) ;;
+            *) echo "::error::refusing to build non-union tag '$tag'"; exit 1 ;;
+          esac
+          # Asset names bundle_juicefs.py resolves: juicefs-<version>-<platform>.tar.gz
+          # under the tag v<version>, so version is the tag minus its leading "v".
+          echo "tag=$tag"               >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}"       >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          set -euxo pipefail
+          go version
+          go build \
+            -tags "$UNION_BUILD_TAGS" \
+            -ldflags "-s -w \
+              -X github.com/juicedata/juicefs/pkg/version.version=${{ steps.v.outputs.version }} \
+              -X github.com/juicedata/juicefs/pkg/version.revision=$(git rev-parse --short HEAD) \
+              -X github.com/juicedata/juicefs/pkg/version.revisionDate=$(git log -1 --pretty=format:%cd --date=short)" \
+            -o juicefs .
+
+      - name: Verify the binary is what we think it is
+        run: |
+          set -euo pipefail
+          file juicefs
+          # A cross-compile slip would silently ship an amd64 binary as arm64.
+          case "${{ matrix.platform }}" in
+            linux-amd64) file juicefs | grep -q "x86-64" ;;
+            linux-arm64) file juicefs | grep -q "aarch64" ;;
+          esac
+          ./juicefs version
+          # Union-only surface: if these are missing the wrong branch got built.
+          ./juicefs mount --help 2>&1 | grep -q -- "--slice-domain"
+          ./juicefs checkpoint --help >/dev/null 2>&1
+          # badger is the flyteplugins-union default metadata store; a build
+          # that dropped it still runs, and only fails later on a user's node
+          # when a volume will not mount. Fail the release here instead.
+          strings juicefs | grep -q "dgraph-io/badger"
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          tar -czf "juicefs-${{ steps.v.outputs.version }}-${{ matrix.platform }}.tar.gz" juicefs
+          sha256sum "juicefs-${{ steps.v.outputs.version }}-${{ matrix.platform }}.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: juicefs-${{ matrix.platform }}
+          path: juicefs-*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: juicefs-*
+          path: dist
+          merge-multiple: true
+
+      - run: ls -la dist
+
+      - name: Attach assets to the tag
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: dist/*.tar.gz
+          prerelease: true
+          # Never clobber hand-written release notes on an existing tag.
+          append_body: true
