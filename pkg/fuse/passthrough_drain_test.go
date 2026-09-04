@@ -106,7 +106,7 @@ func TestFsyncPassesThroughUnknownFh(t *testing.T) {
 // waitInode must return true as soon as the inode is no longer busy.
 func TestWaitInodeReturnsTrueOnceIdle(t *testing.T) {
 	p := &passthroughState{busy: map[Ino]int{}}
-	if !p.waitInode(Ino(1), time.Second, false) {
+	if !p.waitInode(Ino(1), time.Second) {
 		t.Fatalf("waitInode on an idle inode should return true immediately")
 	}
 }
@@ -120,7 +120,7 @@ func TestWaitInodeReturnsTrueOnceIdle(t *testing.T) {
 func TestWaitInodeTimeoutReturnsFalse(t *testing.T) {
 	p := &passthroughState{busy: map[Ino]int{Ino(7): 1}} // never clears
 	start := time.Now()
-	if p.waitInode(Ino(7), 30*time.Millisecond, false) {
+	if p.waitInode(Ino(7), 30*time.Millisecond) {
 		t.Fatalf("waitInode should return false when the inode stays busy past the deadline")
 	}
 	if time.Since(start) < 30*time.Millisecond {
@@ -131,7 +131,7 @@ func TestWaitInodeTimeoutReturnsFalse(t *testing.T) {
 // A nil passthroughState (passthrough disabled) must not block Open.
 func TestWaitInodeNilStateReturnsTrue(t *testing.T) {
 	var p *passthroughState
-	if !p.waitInode(Ino(1), time.Second, false) {
+	if !p.waitInode(Ino(1), time.Second) {
 		t.Fatalf("nil state should return true (no passthrough in use)")
 	}
 }

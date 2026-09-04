@@ -265,11 +265,7 @@ func (fs *fileSystem) Open(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.Op
 	// abnormally slow (or stuck); proceeding anyway would silently serve
 	// stale/empty content as if it were authoritative, so fail the open
 	// instead of guessing — the caller can retry.
-	// A read-only open only needs the content to be in slices, which the
-	// reconcile publishes before it flushes; a write-open must wait for the
-	// whole reconcile, or its backing would shadow the copy still in flight.
-	readOnly := in.Flags&uint32(syscall.O_ACCMODE) == uint32(syscall.O_RDONLY)
-	if !fs.pt.waitInode(Ino(in.NodeId), waitInodeTimeout, readOnly) {
+	if !fs.pt.waitInode(Ino(in.NodeId), waitInodeTimeout) {
 		return fuse.Status(syscall.EAGAIN)
 	}
 	entry, fh, err := fs.v.Open(ctx, Ino(in.NodeId), in.Flags)
