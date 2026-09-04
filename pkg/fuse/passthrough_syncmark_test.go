@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func writeStaging(t *testing.T, path string, data []byte) {
@@ -118,5 +119,54 @@ func TestTruncateClearsSyncMark(t *testing.T) {
 	}
 	if st, err := os.Stat(path); err != nil || st.Size() != 1024 {
 		t.Fatalf("truncate must still mirror the size onto the backing: %v %v", st, err)
+	}
+}
+
+// A reopen of a file whose passthrough reconcile is still finishing used to
+// block for the whole reconcile — seconds per GiB — and hard-fail with EAGAIN
+// at waitInodeTimeout. That is what made `git index-pack` and `uv` fail on a
+// passthrough-backed home volume with "Resource temporarily unavailable".
+// Once the copy has landed in slices, a READER may proceed; a writer may not,
+// because its backing would shadow the reconcile still in flight.
+func TestWaitInodeLetsReadersPastALandedReconcile(t *testing.T) {
+	p := &passthroughState{
+		busy:   map[Ino]int{Ino(3): 1},
+		landed: map[Ino]bool{},
+	}
+
+	// Copy still in flight: nobody gets through.
+	if p.waitInode(Ino(3), 20*time.Millisecond, true) {
+		t.Fatalf("reader passed the fence before the copy landed")
+	}
+
+	if p.waitInode(Ino(3), 20*time.Millisecond, false) {
+		t.Fatalf("writer passed the fence before the copy landed")
+	}
+
+	p.markLanded(Ino(3))
+
+	if !p.waitInode(Ino(3), time.Second, true) {
+		t.Fatalf("reader was still fenced after the copy landed")
+	}
+
+	if p.waitInode(Ino(3), 20*time.Millisecond, false) {
+		t.Fatalf("writer passed the fence while the reconcile was still finishing")
+	}
+}
+
+// The landed marker must not outlive the reconcile that set it: a later
+// passthrough open of the same inode has to fence readers again from scratch.
+func TestReleaseBusyClearsLandedMarker(t *testing.T) {
+	p := &passthroughState{
+		busy:   map[Ino]int{Ino(5): 1},
+		landed: map[Ino]bool{},
+	}
+	p.markLanded(Ino(5))
+	p.mu.Lock()
+	p.releaseBusyLocked(Ino(5))
+	p.mu.Unlock()
+
+	if p.landed[Ino(5)] {
+		t.Fatalf("landed marker survived the reconcile that set it")
 	}
 }

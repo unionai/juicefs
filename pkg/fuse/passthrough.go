@@ -63,12 +63,16 @@ type passthroughState struct {
 	server *fuse.Server
 	dir    string
 
-	mu       sync.Mutex
-	files    map[uint64]*ptFile // keyed by fh
-	busy     map[Ino]int        // inodes with a passthrough open or pending reconcile
-	seq      int                // monotonic counter for unique staging file names
-	disabled bool               // registration failed with a permanent error; stop trying
-	paused   bool               // draining for handover/shutdown; refuse new passthrough opens
+	mu    sync.Mutex
+	files map[uint64]*ptFile // keyed by fh
+	busy  map[Ino]int        // inodes with a passthrough open or pending reconcile
+	// landed marks inodes whose staging content is already in JuiceFS slices
+	// and whose kernel attrs have been invalidated — the reconcile is still
+	// finishing (flush, retire), but a READER may proceed. See waitInode.
+	landed   map[Ino]bool
+	seq      int  // monotonic counter for unique staging file names
+	disabled bool // registration failed with a permanent error; stop trying
+	paused   bool // draining for handover/shutdown; refuse new passthrough opens
 	warnOne  sync.Once
 
 	// Staging headroom. Passthrough writes land in a real file on this
@@ -206,6 +210,7 @@ func newPassthroughState(server *fuse.Server, dir string) *passthroughState {
 		dir:     sub,
 		files:   make(map[uint64]*ptFile),
 		busy:    make(map[Ino]int),
+		landed:  make(map[Ino]bool),
 		minFree: minFree,
 	}
 }
@@ -399,9 +404,19 @@ func (p *passthroughState) tryOpen(ino Ino, fh uint64, flags uint32, emptyAtOpen
 func (p *passthroughState) releaseBusyLocked(ino Ino) {
 	if n := p.busy[ino]; n <= 1 {
 		delete(p.busy, ino)
+		delete(p.landed, ino)
 	} else {
 		p.busy[ino] = n - 1
 	}
+}
+
+// markLanded records that ino's staging content is now in slices and the
+// kernel's stale attrs have been invalidated, so readers no longer need to
+// wait out the rest of the reconcile.
+func (p *passthroughState) markLanded(ino Ino) {
+	p.mu.Lock()
+	p.landed[ino] = true
+	p.mu.Unlock()
 }
 
 // waitInode blocks (bounded) until ino has no passthrough open or in-flight
@@ -417,14 +432,14 @@ func (p *passthroughState) releaseBusyLocked(ino Ino) {
 // in-flight reconcile hasn't landed it), so the caller MUST NOT treat it as
 // authoritative — proceeding as if the wait had succeeded would silently
 // serve stale/empty content as if it were the real, reconciled file.
-func (p *passthroughState) waitInode(ino Ino, timeout time.Duration) bool {
+func (p *passthroughState) waitInode(ino Ino, timeout time.Duration, readOnly bool) bool {
 	if p == nil {
 		return true
 	}
 	deadline := time.Now().Add(timeout)
 	for {
 		p.mu.Lock()
-		busy := p.busy[ino] > 0
+		busy := p.busy[ino] > 0 && !(readOnly && p.landed[ino])
 		p.mu.Unlock()
 		if !busy {
 			return true
@@ -515,16 +530,31 @@ func (p *passthroughState) reconcile(ctx vfs.Context, v *vfs.VFS, fh uint64) {
 			return
 		}
 	}
+	// Passthrough writes bypassed the daemon, so the kernel's cached size and
+	// page data for this inode are stale (size is still 0 from the empty
+	// create). The bytes are in slices as of the copy above, and VFS.Read
+	// flushes the inode's writer before serving any read, so the content is
+	// readable now — invalidate both caches here rather than after the flush
+	// below, and let readers past the fence.
+	p.server.InodeNotify(uint64(pf.ino), -1, 0)         // attributes (size/mtime)
+	p.server.InodeNotify(uint64(pf.ino), 0, int64(off)) // data range
+	// Readers may proceed from here. Writers stay fenced until this function
+	// returns, because a second passthrough writer would otherwise get its own
+	// empty backing while this inode's registration is still live.
+	//
+	// The relaxation is deliberate and it does give something up: if the flush
+	// below fails, a reader may already have seen content that never reached
+	// the object store, where previously the inode stayed at size 0 and the
+	// data was quarantined in an .orphan sibling before anyone could observe
+	// it. That trade matches the rest of the filesystem — an ordinary
+	// write-back write is readable long before it is durable — and it exists
+	// because the alternative is a same-inode reopen stalling for the whole
+	// reconcile, which is seconds per GiB and hard-fails at waitInodeTimeout.
+	p.markLanded(pf.ino)
 	if e := v.Flush(ctx, pf.ino, fh, 0); e != 0 {
 		logger.Errorf("passthrough: reconcile flush ino %d: %s", pf.ino, e)
 		return
 	}
-	// Passthrough writes bypassed the daemon, so the kernel's cached size and
-	// page data for this inode are stale (size is still 0 from the empty
-	// create). Now that the slices + metadata are committed, invalidate both so
-	// readers in this mount session see the reconciled file (read-your-writes).
-	p.server.InodeNotify(uint64(pf.ino), -1, 0)         // attributes (size/mtime)
-	p.server.InodeNotify(uint64(pf.ino), 0, int64(off)) // data range
 	// Data is safely in JuiceFS: retire the registration and staging file for
 	// good. No truncate needed — retire removes the file outright.
 	done = true
