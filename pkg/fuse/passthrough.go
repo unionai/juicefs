@@ -29,6 +29,7 @@ import (
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/juicedata/juicefs/pkg/vfs"
+	"github.com/zeebo/blake3"
 )
 
 // passthroughState manages per-open backing files used for FUSE passthrough
@@ -112,6 +113,64 @@ type ptFile struct {
 	// mu serializes staging-content copies for this open: fsync-time copies
 	// against each other and against the final release-time reconcile.
 	mu sync.Mutex
+	// synced is the fingerprint of the staging content the last fsync-time
+	// copy landed in JuiceFS, or nil if no fsync has copied yet. A later
+	// copy (another fsync, or the release-time reconcile) is skipped when the
+	// staging still matches it: the bytes are already in slices, and copying
+	// them again would upload the whole file a second time. Every path that
+	// changes the JuiceFS inode behind the staging's back must clear it (see
+	// truncate). Guarded by mu.
+	synced *ptSyncMark
+}
+
+// ptSyncMark fingerprints staging content that has been copied into JuiceFS.
+// Content-addressed, not stat-based: timestamps on the staging filesystem
+// are too coarse to order a write against the copy that just finished, and
+// mmap writes to a tmpfs backing do not update them at all.
+type ptSyncMark struct {
+	size uint64
+	sum  [32]byte
+}
+
+// fingerprintStaging hashes the staging file at path from offset 0 through
+// EOF, the same bytes copyStagingLocked would copy. Opened by path: reading
+// through the registered backing fd can return stale or partial data.
+func fingerprintStaging(path string) (*ptSyncMark, error) {
+	rf, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer rf.Close()
+	h := blake3.New()
+	buf := utils.Alloc(4 << 20)
+	defer utils.Free(buf)
+	n, err := io.CopyBuffer(h, rf, buf)
+	if err != nil {
+		return nil, err
+	}
+	m := &ptSyncMark{size: uint64(n)}
+	copy(m.sum[:], h.Sum(nil))
+	return m, nil
+}
+
+// stagingUnchangedLocked reports whether the staging content still matches
+// the fingerprint recorded by the last fsync-time copy. False when there is
+// no mark, when the size differs (cheap, checked first), or when the content
+// hash differs. Any error reads as "changed" so the caller falls back to the
+// full copy, which is always safe. Caller holds pf.mu.
+func (pf *ptFile) stagingUnchangedLocked() bool {
+	if pf.synced == nil {
+		return false
+	}
+	st, err := os.Stat(pf.b.path)
+	if err != nil || uint64(st.Size()) != pf.synced.size {
+		return false
+	}
+	m, err := fingerprintStaging(pf.b.path)
+	if err != nil {
+		return false
+	}
+	return m.size == pf.synced.size && m.sum == pf.synced.sum
 }
 
 func newPassthroughState(server *fuse.Server, dir string) *passthroughState {
@@ -441,9 +500,20 @@ func (p *passthroughState) reconcile(ctx vfs.Context, v *vfs.VFS, fh uint64) {
 
 	pf.mu.Lock()
 	defer pf.mu.Unlock()
-	off, ok := p.copyStagingLocked(ctx, v, pf)
-	if !ok {
-		return
+	var off uint64
+	if pf.stagingUnchangedLocked() {
+		// An fsync already copied exactly this content into slices; a second
+		// full copy would re-upload the whole file (measured: every
+		// write-fsync-close paid 2x its size in object PUTs). Skip the copy;
+		// the flush below still lands anything the writer holds.
+		off = pf.synced.size
+		logger.Debugf("passthrough: ino %d staging unchanged since fsync, not recopying %d bytes", pf.ino, off)
+	} else {
+		var ok bool
+		off, _, ok = p.copyStagingLocked(ctx, v, pf)
+		if !ok {
+			return
+		}
 	}
 	if e := v.Flush(ctx, pf.ino, fh, 0); e != 0 {
 		logger.Errorf("passthrough: reconcile flush ino %d: %s", pf.ino, e)
@@ -467,14 +537,19 @@ func (p *passthroughState) reconcile(ctx vfs.Context, v *vfs.VFS, fh uint64) {
 // or the caller would flush+commit a truncated file as if complete. Always a
 // FULL copy from offset 0: passthrough writes land in the backing at
 // arbitrary offsets, so an incremental "since last copy" scheme would miss
-// overwrites of already-copied ranges. Caller holds pf.mu.
-func (p *passthroughState) copyStagingLocked(ctx vfs.Context, v *vfs.VFS, pf *ptFile) (uint64, bool) {
+// overwrites of already-copied ranges. Also returns the blake3 fingerprint of
+// the bytes copied, so an fsync-time copy can record what is now in slices
+// and a later copy can be skipped if the staging has not changed since.
+// Caller holds pf.mu.
+func (p *passthroughState) copyStagingLocked(ctx vfs.Context, v *vfs.VFS, pf *ptFile) (uint64, [32]byte, bool) {
+	var sum [32]byte
 	rf, err := os.Open(pf.b.path)
 	if err != nil {
 		logger.Errorf("passthrough: reopen staging %s: %s", pf.b.path, err)
-		return 0, false
+		return 0, sum, false
 	}
 	defer rf.Close()
+	h := blake3.New()
 	// Pooled/accounted allocation: vfs.writer's and vfs/compact's memory
 	// backpressure (utils.AllocMemory()-store.UsedMemory()) only sees bytes
 	// allocated through utils.Alloc. A raw make() here would be invisible to
@@ -491,21 +566,23 @@ func (p *passthroughState) copyStagingLocked(ctx vfs.Context, v *vfs.VFS, pf *pt
 			// own backing array so the next Read doesn't corrupt a pending slice.
 			chunk := make([]byte, n)
 			copy(chunk, buf[:n])
+			_, _ = h.Write(chunk)
 			if e := v.Write(ctx, pf.ino, chunk, off, pf.fh); e != 0 {
 				logger.Errorf("passthrough: staging copy write ino %d off %d: %s", pf.ino, off, e)
-				return off, false
+				return off, sum, false
 			}
 			off += uint64(n)
 		}
 		if err != nil {
 			if err != io.EOF {
 				logger.Errorf("passthrough: read staging %s at off %d: %s", pf.b.path, off, err)
-				return off, false
+				return off, sum, false
 			}
 			break
 		}
 	}
-	return off, true
+	copy(sum[:], h.Sum(nil))
+	return off, sum, true
 }
 
 // fsync makes fsync(2)/fdatasync(2) honest for a passthrough open. The
@@ -514,9 +591,12 @@ func (p *passthroughState) copyStagingLocked(ctx vfs.Context, v *vfs.VFS, pf *pt
 // vfs.Fsync would report success while every byte still sits in a local
 // staging file that a crash before release would lose. Instead, copy the
 // staging content into JuiceFS slices now (the open stays live and the
-// backing stays registered; the release-time reconcile recopies and remains
-// the authority on final content) and then flush the writer, giving the
-// caller exactly the durability a non-passthrough fsync provides.
+// backing stays registered) and then flush the writer, giving the caller
+// exactly the durability a non-passthrough fsync provides. The copy records
+// a fingerprint of what it landed; the release-time reconcile — still the
+// authority on final content — recopies only if the staging changed after
+// this point, so a write-fsync-close sequence uploads its bytes once, not
+// twice. A second fsync with nothing new likewise copies nothing.
 //
 // Returns handled=false when fh is not a passthrough open (caller proceeds
 // with the normal path).
@@ -537,10 +617,14 @@ func (p *passthroughState) fsync(ctx vfs.Context, v *vfs.VFS, fh uint64) (bool, 
 	// of a file the application believes it just made durable.
 	v.BeginExternalFlush()
 	defer v.EndExternalFlush()
-	if _, ok := p.copyStagingLocked(ctx, v, pf); !ok {
-		// The open is still live and release will retry the copy; report the
-		// failure so the application does not trust this fsync.
-		return true, syscall.EIO
+	if !pf.stagingUnchangedLocked() {
+		off, sum, ok := p.copyStagingLocked(ctx, v, pf)
+		if !ok {
+			// The open is still live and release will retry the copy; report
+			// the failure so the application does not trust this fsync.
+			return true, syscall.EIO
+		}
+		pf.synced = &ptSyncMark{size: off, sum: sum}
 	}
 	if e := v.Fsync(ctx, pf.ino, 0, fh); e != 0 {
 		return true, e
@@ -573,6 +657,11 @@ func (p *passthroughState) truncate(ino Ino, size uint64) {
 	}
 	pf.mu.Lock()
 	defer pf.mu.Unlock()
+	// The JuiceFS inode just changed behind the staging's back: a later
+	// staging that happens to match the fsync-time fingerprint again (shrink,
+	// then rewrite the same tail) would otherwise skip a copy the truncated
+	// inode needs. Forget the mark so the next copy is a full one.
+	pf.synced = nil
 	if err := pf.b.f.Truncate(int64(size)); err != nil {
 		logger.Errorf("passthrough: mirror truncate ino %d to %d on %s: %s", ino, size, pf.b.path, err)
 	}
