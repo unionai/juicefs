@@ -972,6 +972,32 @@ func installHandler(m meta.Meta, mp string, v *vfs.VFS, blob object.ObjectStorag
 			// and backing registrations are still valid; the timeout
 			// goroutine below is an unconditional backstop if this runs long.
 			fuse.ReconcileAllPassthrough(vfs.NewLogContext(meta.Background()), v)
+			if csiCommPath != "" {
+				// This client adopted a pre-made FUSE channel (JFS_SUPER_COMM):
+				// the mountpoint belongs to whoever premounted it, not to us,
+				// so the doUmount below can never succeed and we would sit out
+				// the 30s backstop before exiting — still serving a session the
+				// orchestrator already considers stopped. A second client
+				// adopting the channel in that window shares one FUSE
+				// connection with this one, and their requests interleave.
+				// Flush what we owe and leave; tearing the channel down is the
+				// premounter's job.
+				go func() {
+					hardStop := time.Now().Add(time.Minute * 10)
+					for v.ExternalFlushes() > 0 && time.Now().Before(hardStop) {
+						time.Sleep(time.Millisecond * 100)
+					}
+					if n := v.ExternalFlushes(); n > 0 {
+						logger.Errorf("exit with %d unfinished passthrough reconcile(s); their files may be committed incomplete", n)
+					}
+					if err := v.FlushAll(""); err != nil {
+						logger.Errorf("flush all: %s", err)
+					}
+					logger.Infof("exit after receiving signal %s; the channel's owner unmounts it", sig)
+					os.Exit(meta.UmountCode)
+				}()
+				continue
+			}
 			go func() {
 				time.Sleep(time.Second * 30)
 				// The umount is stuck, but a passthrough reconcile may still
