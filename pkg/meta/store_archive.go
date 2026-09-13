@@ -18,12 +18,15 @@ package meta
 
 import (
 	"archive/tar"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"golang.org/x/sys/unix"
 )
 
 // A *store archive* is an uncompressed tar of a metadata store DIRECTORY,
@@ -130,28 +133,69 @@ func appendFile(tw *tar.Writer, dir, name string) error {
 	if err != nil {
 		return err
 	}
+	end, err := dataEnd(in, st.Size())
+	if err != nil {
+		return err
+	}
 	hdr := &tar.Header{
 		Typeflag: tar.TypeReg,
 		Name:     name,
 		Mode:     int64(st.Mode().Perm()),
-		Size:     st.Size(),
+		Size:     end,
 		ModTime:  st.ModTime(),
 		Format:   tar.FormatPAX,
 	}
 	if err := tw.WriteHeader(hdr); err != nil {
 		return err
 	}
-	n, err := io.Copy(tw, in)
+	n, err := io.Copy(tw, io.LimitReader(in, end))
 	if err != nil {
 		return err
 	}
-	if n != st.Size() {
+	if n != end {
 		// The engine is not writing to this directory while we archive it
-		// (offline, or a private copy we just built), so a size change means
+		// (offline, or a private copy we just built), so a short read means
 		// something else is — and the archive would be corrupt.
-		return fmt.Errorf("%s changed size while being archived (%d != %d)", name, n, st.Size())
+		return fmt.Errorf("%s changed size while being archived (%d != %d)", name, n, end)
 	}
 	return nil
+}
+
+// dataEnd returns the offset past the last real byte of f, ignoring a
+// trailing hole.
+//
+// Badger preallocates: a live store's active value log is a 2 GB file with
+// 16 KB of data in it, and its memtable WAL is a 128 MB file holding a few
+// hundred bytes. Archiving those at their apparent size would put two
+// gigabytes of zeros into every artifact.
+//
+// Trimming a *trailing* hole is what Badger itself does when it closes a
+// store, and what it does again when it reopens one: the value log and the
+// memtable WAL are each replayed to the first invalid entry and truncated
+// there, so a file that ends early is the ordinary crash-recovery case, not
+// a corrupt one. A hole in the *middle* is not something this code
+// understands, so such a file is archived whole.
+func dataEnd(f *os.File, size int64) (int64, error) {
+	firstHole, err := f.Seek(0, unix.SEEK_HOLE)
+	if err != nil {
+		// No SEEK_HOLE on this filesystem: every byte is data as far as we know.
+		return size, resetOffset(f)
+	}
+	if firstHole >= size {
+		return size, resetOffset(f)
+	}
+	if _, err := f.Seek(firstHole, unix.SEEK_DATA); err != nil {
+		if errors.Is(err, unix.ENXIO) {
+			return firstHole, resetOffset(f) // trailing hole: the file really ends here
+		}
+		return size, resetOffset(f)
+	}
+	return size, resetOffset(f)
+}
+
+func resetOffset(f *os.File) error {
+	_, err := f.Seek(0, io.SeekStart)
+	return err
 }
 
 // RestoreStoreArchive untars a store archive into dir, which must not

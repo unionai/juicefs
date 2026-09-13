@@ -201,3 +201,101 @@ func TestRestoreStoreArchiveRefusesNonEmptyDestination(t *testing.T) {
 		t.Fatalf("RestoreStoreArchive into a non-empty directory must fail")
 	}
 }
+
+// Badger preallocates: a live store's active value log is a 2 GB file with
+// a few KB in it. Archiving it at its apparent size would put two gigabytes
+// of zeros into every artifact.
+func TestStoreArchiveTrimsPreallocatedTails(t *testing.T) {
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "src")
+	writeStoreDir(t, src, map[string][]byte{"MANIFEST": []byte("m")})
+
+	vlog := filepath.Join(src, "000002.vlog")
+	f, err := os.Create(vlog)
+	if err != nil {
+		t.Fatalf("create vlog: %s", err)
+	}
+	if _, err := f.Write([]byte("real entries")); err != nil {
+		t.Fatalf("write: %s", err)
+	}
+	const apparent = 2 << 30
+	if err := f.Truncate(apparent); err != nil {
+		t.Fatalf("truncate: %s", err)
+	}
+	f.Close()
+
+	arc := filepath.Join(tmp, "store.tar")
+	if err := tarDirectory(src, arc); err != nil {
+		t.Fatalf("tarDirectory: %s", err)
+	}
+	ai, err := os.Stat(arc)
+	if err != nil {
+		t.Fatalf("stat archive: %s", err)
+	}
+	if ai.Size() > 1<<20 {
+		t.Fatalf("archive is %d bytes; the preallocated tail was not trimmed", ai.Size())
+	}
+
+	dst := filepath.Join(tmp, "dst")
+	if err := RestoreStoreArchive(arc, dst); err != nil {
+		t.Fatalf("RestoreStoreArchive: %s", err)
+	}
+	got, err := os.ReadFile(filepath.Join(dst, "000002.vlog"))
+	if err != nil {
+		t.Fatalf("read restored vlog: %s", err)
+	}
+	// Every real byte survives. The trim lands on the filesystem's block
+	// boundary rather than the exact last byte, so a few trailing zeros come
+	// along — which is what the engine writes there anyway, and what its own
+	// replay-then-truncate handles on the next open.
+	if !bytes.HasPrefix(got, []byte("real entries")) {
+		t.Fatalf("restored vlog does not start with the real entries: %q", got[:min(32, len(got))])
+	}
+	if len(got) > 1<<20 {
+		t.Fatalf("restored vlog is %d bytes; the tail was not trimmed", len(got))
+	}
+}
+
+// A hole in the middle is not a shape this code understands, so the file
+// must come back whole rather than silently truncated at the hole.
+func TestStoreArchiveKeepsFilesWithInteriorHoles(t *testing.T) {
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "src")
+	writeStoreDir(t, src, map[string][]byte{"MANIFEST": []byte("m")})
+
+	p := filepath.Join(src, "000003.vlog")
+	f, err := os.Create(p)
+	if err != nil {
+		t.Fatalf("create: %s", err)
+	}
+	if _, err := f.Write([]byte("head")); err != nil {
+		t.Fatalf("write head: %s", err)
+	}
+	if _, err := f.Seek(1<<20, 0); err != nil {
+		t.Fatalf("seek: %s", err)
+	}
+	if _, err := f.Write([]byte("tail")); err != nil {
+		t.Fatalf("write tail: %s", err)
+	}
+	f.Close()
+	want, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatalf("read source: %s", err)
+	}
+
+	arc := filepath.Join(tmp, "store.tar")
+	if err := tarDirectory(src, arc); err != nil {
+		t.Fatalf("tarDirectory: %s", err)
+	}
+	dst := filepath.Join(tmp, "dst")
+	if err := RestoreStoreArchive(arc, dst); err != nil {
+		t.Fatalf("RestoreStoreArchive: %s", err)
+	}
+	got, err := os.ReadFile(filepath.Join(dst, "000003.vlog"))
+	if err != nil {
+		t.Fatalf("read restored: %s", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("restored file differs: %d bytes vs %d", len(got), len(want))
+	}
+}
