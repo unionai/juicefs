@@ -44,8 +44,11 @@ or overwrites a live store.
 Engines whose checkpoint artifact is directly usable need no restore step:
 SQLite snapshots are themselves mountable database files (this command just
 copies them for convenience), and Redis RDB files are loaded by the server.
-BadgerDB checkpoints are backup streams and MUST be restored with this
-command before mounting.
+
+BadgerDB checkpoints are store archives — a tar of the store directory — and
+this command untars one into META-URL's directory; no engine is involved and
+nothing is replayed. Artifacts published before that format existed are
+Badger backup streams, and are detected and replayed instead.
 
 Examples:
 $ juicefs checkpoint-restore /var/lib/vol/checkpoint.bak badger:///var/lib/vol/meta
@@ -86,6 +89,27 @@ func checkpointRestore(ctx *cli.Context) error {
 			return err
 		}
 		logger.Infof("restored %s to %s", src, p)
+		return nil
+	}
+
+	// A store archive holds the engine's own directory, so the restore is an
+	// untar and the engine never has to replay anything. Sniffing the
+	// artifact rather than trusting the caller keeps older, dump-shaped
+	// checkpoints restorable through the same command.
+	archive, err := meta.IsStoreArchive(src)
+	if err != nil {
+		return fmt.Errorf("read checkpoint artifact %s: %s", src, err)
+	}
+	if archive {
+		dir, ok := strings.CutPrefix(uri, "badger://")
+		if !ok {
+			return fmt.Errorf("%s is a store archive, which only directory-shaped stores (badger://) can restore; got %s", src, uri)
+		}
+		dir = strings.Split(dir, "?")[0]
+		if err := meta.RestoreStoreArchive(src, dir); err != nil {
+			return fmt.Errorf("restore %s into %s: %s", src, uri, err)
+		}
+		logger.Infof("restored %s to %s (store archive)", src, uri)
 		return nil
 	}
 

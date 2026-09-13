@@ -48,7 +48,9 @@ stores (BadgerDB) are snapshotted after unmount, where no live client
 holds the store open.
 
 Supported stores: SQLite (VACUUM INTO), Redis (BGSAVE, co-located server),
-BadgerDB (backup stream). Other engines return ENOTSUP.
+BadgerDB (store archive: a tar of a consistent, compacted copy of the store
+directory, which 'juicefs checkpoint-restore' untars rather than replays).
+Other engines return ENOTSUP.
 
 Examples:
 $ juicefs checkpoint /mnt/jfs /var/lib/vol/checkpoint.db

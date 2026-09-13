@@ -153,7 +153,8 @@ func TestCheckpointStoreSQLiteFailedWritePreservesDst(t *testing.T) {
 	}
 }
 
-// Badger: CheckpointStore streams a non-empty backup of the live store.
+// Badger: CheckpointStore writes a store archive — a tar of a standalone
+// store directory, not a logical dump that something has to replay.
 func TestCheckpointStoreBadger(t *testing.T) {
 	tmp := t.TempDir()
 	m, err := newKVMeta("badger", filepath.Join(tmp, "meta"), testConfig())
@@ -173,7 +174,36 @@ func TestCheckpointStoreBadger(t *testing.T) {
 	}
 	fi, err := os.Stat(dst)
 	if err != nil || fi.Size() == 0 {
-		t.Fatalf("backup empty or missing: %v %v", fi, err)
+		t.Fatalf("checkpoint empty or missing: %v %v", fi, err)
+	}
+	archive, err := IsStoreArchive(dst)
+	if err != nil {
+		t.Fatalf("sniff checkpoint: %s", err)
+	}
+	if !archive {
+		t.Fatalf("badger checkpoint at %s is not a store archive", dst)
+	}
+	// The archive must hold the engine's own files, so that restoring is an
+	// untar and nothing has to be replayed.
+	out := filepath.Join(tmp, "unpacked")
+	if err := RestoreStoreArchive(dst, out); err != nil {
+		t.Fatalf("RestoreStoreArchive: %s", err)
+	}
+	ents, err := os.ReadDir(out)
+	if err != nil {
+		t.Fatalf("read unpacked: %s", err)
+	}
+	var manifest bool
+	for _, e := range ents {
+		if e.Name() == "MANIFEST" {
+			manifest = true
+		}
+		if e.Name() == "LOCK" {
+			t.Fatalf("archive carried the engine's LOCK file forward")
+		}
+	}
+	if !manifest {
+		t.Fatalf("unpacked archive has no MANIFEST: %v", ents)
 	}
 }
 
@@ -244,8 +274,9 @@ func TestCheckpointStoreRedisWaitsOutForeignBgSave(t *testing.T) {
 	}
 }
 
-// Badger: a checkpoint restored into a fresh store must reproduce the
-// filesystem and remain writable (fork-from-commit round trip).
+// Badger: a checkpoint unpacked into a fresh directory must reproduce the
+// filesystem and remain writable (fork-from-commit round trip). The engine
+// opens the unpacked directory directly — there is no replay step.
 func TestRestoreStoreBadger(t *testing.T) {
 	tmp := t.TempDir()
 	m, err := newKVMeta("badger", filepath.Join(tmp, "src"), testConfig())
@@ -269,12 +300,13 @@ func TestRestoreStoreBadger(t *testing.T) {
 		t.Fatalf("CheckpointStore: %s", err)
 	}
 
-	m2, err := newKVMeta("badger", filepath.Join(tmp, "dst"), testConfig())
-	if err != nil {
-		t.Fatalf("create dst meta: %s", err)
+	dstDir := filepath.Join(tmp, "dst")
+	if err := RestoreStoreArchive(bak, dstDir); err != nil {
+		t.Fatalf("RestoreStoreArchive: %s", err)
 	}
-	if err := m2.RestoreStore(ctx, bak); err != nil {
-		t.Fatalf("RestoreStore: %s", err)
+	m2, err := newKVMeta("badger", dstDir, testConfig())
+	if err != nil {
+		t.Fatalf("open restored meta: %s", err)
 	}
 	if _, err := m2.Load(true); err != nil {
 		t.Fatalf("load restored format: %s", err)
@@ -291,9 +323,86 @@ func TestRestoreStoreBadger(t *testing.T) {
 		t.Fatalf("create in restored store: %s", st)
 	}
 
-	// Never restore into a store that already holds data.
-	if err := m2.RestoreStore(ctx, bak); err == nil {
-		t.Fatalf("RestoreStore into non-empty store must fail")
+	// Never restore over a directory that already holds data: two histories
+	// must not be merged.
+	if err := RestoreStoreArchive(bak, dstDir); err == nil {
+		t.Fatalf("RestoreStoreArchive into a non-empty directory must fail")
+	}
+}
+
+// The checkpoint reads at one timestamp, so a client that keeps writing
+// throughout must not tear it — this is what makes the hourly keep-alive
+// checkpoint of a live volume safe.
+func TestCheckpointStoreBadgerUnderConcurrentWrites(t *testing.T) {
+	tmp := t.TempDir()
+	m, err := newKVMeta("badger", filepath.Join(tmp, "src"), testConfig())
+	if err != nil {
+		t.Fatalf("create meta: %s", err)
+	}
+	if err = m.Reset(); err != nil {
+		t.Fatalf("reset: %s", err)
+	}
+	if err = m.Init(testFormat(), true); err != nil {
+		t.Fatalf("init: %s", err)
+	}
+	ctx := Background()
+	var inode Ino
+	var attr Attr
+	for i := 0; i < 200; i++ {
+		if st := m.Create(ctx, RootInode, "before-"+strconv.Itoa(i), 0644, 022, 0, &inode, &attr); st != 0 {
+			t.Fatalf("seed file: %s", st)
+		}
+	}
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			var ino Ino
+			var a Attr
+			if st := m.Create(ctx, RootInode, "during-"+strconv.Itoa(i), 0644, 022, 0, &ino, &a); st != 0 {
+				return
+			}
+		}
+	}()
+
+	dst := filepath.Join(tmp, "snap.tar")
+	err = m.CheckpointStore(ctx, dst)
+	close(stop)
+	<-done
+	if err != nil {
+		t.Fatalf("CheckpointStore under writes: %s", err)
+	}
+
+	dstDir := filepath.Join(tmp, "dst")
+	if err := RestoreStoreArchive(dst, dstDir); err != nil {
+		t.Fatalf("RestoreStoreArchive: %s", err)
+	}
+	m2, err := newKVMeta("badger", dstDir, testConfig())
+	if err != nil {
+		t.Fatalf("open restored meta: %s", err)
+	}
+	if _, err := m2.Load(true); err != nil {
+		t.Fatalf("load restored format: %s", err)
+	}
+	// Everything written before the checkpoint started must be there; files
+	// written during it may or may not be, but the store must be coherent
+	// and writable either way.
+	for i := 0; i < 200; i++ {
+		var ino Ino
+		if st := m2.Lookup(ctx, RootInode, "before-"+strconv.Itoa(i), &ino, &attr, false); st != 0 {
+			t.Fatalf("lookup before-%d in restored store: %s", i, st)
+		}
+	}
+	var ino Ino
+	if st := m2.Create(ctx, RootInode, "after", 0644, 022, 0, &ino, &attr); st != 0 {
+		t.Fatalf("create in restored store: %s", st)
 	}
 }
 
