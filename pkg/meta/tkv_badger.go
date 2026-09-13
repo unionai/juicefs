@@ -154,10 +154,11 @@ type badgerClient struct {
 //
 // The older artifact for this engine was a Badger *backup stream*, which is
 // a logical dump — restoring one replays every key through the normal write
-// path, and on a real volume's 677 MB stream that cost 13.7 s on the mount's
-// critical path. Building the directory here instead moves that work to the
-// checkpoint, which nothing is waiting on, and hands the mount a 0.2 s
-// untar. Restores still accept the old format; see restoreFrom.
+// path, on the critical path of a mount. Measured on a store of 1M files:
+// 5.5 s to restore the 268 MB stream, against 0.68 s to untar the 88 MB
+// archive. Building the directory here moves what work remains to the
+// checkpoint, which nothing is waiting on. Restores still accept the old
+// format; see restoreFrom.
 //
 // Consistency comes from Stream, which iterates at a single read timestamp,
 // so this is safe against a live client that keeps writing throughout.

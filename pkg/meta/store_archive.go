@@ -35,9 +35,9 @@ import (
 //
 // It exists because the alternative artifact for a directory-shaped engine
 // is a logical dump (BadgerDB's backup stream), and replaying such a dump
-// costs as much as the original writes did: restoring a 677 MB stream of a
-// real volume's metadata took 13.7 s, against 0.2 s to untar the 339 MB
-// directory it produces. A mount pays that cost on its critical path, so
+// costs as much as the original writes did. Measured on a store of 1M
+// files: 5.5 s to restore the 268 MB stream, against 0.68 s to untar the
+// 88 MB archive it becomes. A mount pays that cost on its critical path, so
 // the archive is what the checkpoint verbs write and read.
 //
 // The format is deliberately boring — `tar tvf` works on it, and the files
