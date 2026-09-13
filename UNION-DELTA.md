@@ -25,6 +25,7 @@ Branch layout:
 | grpc/stats/opentelemetry ambiguous-import build fix | `haytham/fix-ambiguous-grpc-otel` | trivially upstreamable — offer any time |
 | `checkpoint` control verb (durable live metadata snapshot) | `haytham/checkpoint-verb` | candidate — generically useful, pitch after #7202 |
 | `checkpoint-restore` (materialize a store from a checkpoint artifact) | `haytham/checkpoint-restore` | candidate, pairs with the verb |
+| Store archives: directory-shaped engines checkpoint to a tar of the store directory instead of a logical dump | `haytham/badger-dir-checkpoint` | candidate — pairs with the checkpoint verbs; the win (no replay on restore) is generic to BadgerDB |
 | `--slice-domain` (partition slice IDs per writer session) | `haytham/domain-scoped-slices` | union-only — encodes Union's volume fork/branch model |
 | `slice-refs` (GC reference extraction from commit indexes) | `haytham/slice-refs` | union-only — serves Union's GC reaper design |
 | `go.mod`: replace go-fuse with `github.com/unionai/go-fuse/v2` release tags | `union` only | n/a (fork plumbing; upstream PR #7202 carries its own replace pointing at go-fuse#53) |
