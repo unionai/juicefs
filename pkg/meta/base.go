@@ -3587,7 +3587,11 @@ func (m *baseMeta) mergeAttr(ctx Context, inode Ino, set uint16, cur, attr *Attr
 		changed = true
 	}
 	if set&SetAttrGID != 0 {
-		if ctx.Uid() != 0 && ctx.Uid() != cur.Uid {
+		// Owner-or-root, like the uid rule below: only when the daemon is the
+		// one checking permissions. With the kernel checking (default
+		// permissions) the caller may be a user-namespace root whose uid does
+		// not match the file's, and the kernel has already allowed the chgrp.
+		if ctx.CheckPermission() && ctx.Uid() != 0 && ctx.Uid() != cur.Uid {
 			return nil, syscall.EPERM
 		}
 		if cur.Gid != attr.Gid {
@@ -3617,7 +3621,7 @@ func (m *baseMeta) mergeAttr(ctx Context, inode Ino, set uint16, cur, attr *Attr
 			dirtyAttr.Mode = attr.Mode&07000 | rule.GetMode()
 			changed = true
 		} else if attr.Mode != cur.Mode {
-			if ctx.Uid() != 0 && ctx.Uid() != cur.Uid &&
+			if ctx.CheckPermission() && ctx.Uid() != 0 && ctx.Uid() != cur.Uid &&
 				(cur.Mode&01777 != attr.Mode&01777 || attr.Mode&02000 > cur.Mode&02000 || attr.Mode&04000 > cur.Mode&04000) {
 				return nil, syscall.EPERM
 			}
@@ -3626,17 +3630,17 @@ func (m *baseMeta) mergeAttr(ctx Context, inode Ino, set uint16, cur, attr *Attr
 		}
 	}
 	if set&SetAttrAtimeNow != 0 || (set&SetAttrAtime) != 0 && attr.Atime < 0 {
-		if st := m.Access(ctx, inode, MODE_MASK_W, cur); ctx.Uid() != cur.Uid && st != 0 {
+		if st := m.Access(ctx, inode, MODE_MASK_W, cur); ctx.CheckPermission() && ctx.Uid() != cur.Uid && st != 0 {
 			return nil, syscall.EACCES
 		}
 		dirtyAttr.Atime = now.Unix()
 		dirtyAttr.Atimensec = uint32(now.Nanosecond())
 		changed = true
 	} else if set&SetAttrAtime != 0 && (cur.Atime != attr.Atime || cur.Atimensec != attr.Atimensec) {
-		if cur.Uid == 0 && ctx.Uid() != 0 {
+		if ctx.CheckPermission() && cur.Uid == 0 && ctx.Uid() != 0 {
 			return nil, syscall.EPERM
 		}
-		if st := m.Access(ctx, inode, MODE_MASK_W, cur); ctx.Uid() != cur.Uid && st != 0 {
+		if st := m.Access(ctx, inode, MODE_MASK_W, cur); ctx.CheckPermission() && ctx.Uid() != cur.Uid && st != 0 {
 			return nil, syscall.EACCES
 		}
 		dirtyAttr.Atime = attr.Atime
@@ -3644,17 +3648,17 @@ func (m *baseMeta) mergeAttr(ctx Context, inode Ino, set uint16, cur, attr *Attr
 		changed = true
 	}
 	if set&SetAttrMtimeNow != 0 || (set&SetAttrMtime) != 0 && attr.Mtime < 0 {
-		if st := m.Access(ctx, inode, MODE_MASK_W, cur); ctx.Uid() != cur.Uid && st != 0 {
+		if st := m.Access(ctx, inode, MODE_MASK_W, cur); ctx.CheckPermission() && ctx.Uid() != cur.Uid && st != 0 {
 			return nil, syscall.EACCES
 		}
 		dirtyAttr.Mtime = now.Unix()
 		dirtyAttr.Mtimensec = uint32(now.Nanosecond())
 		changed = true
 	} else if set&SetAttrMtime != 0 && (cur.Mtime != attr.Mtime || cur.Mtimensec != attr.Mtimensec) {
-		if cur.Uid == 0 && ctx.Uid() != 0 {
+		if ctx.CheckPermission() && cur.Uid == 0 && ctx.Uid() != 0 {
 			return nil, syscall.EPERM
 		}
-		if st := m.Access(ctx, inode, MODE_MASK_W, cur); ctx.Uid() != cur.Uid && st != 0 {
+		if st := m.Access(ctx, inode, MODE_MASK_W, cur); ctx.CheckPermission() && ctx.Uid() != cur.Uid && st != 0 {
 			return nil, syscall.EACCES
 		}
 		dirtyAttr.Mtime = attr.Mtime
