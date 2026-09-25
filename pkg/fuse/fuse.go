@@ -590,7 +590,17 @@ func Serve(v *vfs.VFS, options string, xattrs, ioctl bool) error {
 	ptEnabled := os.Getenv("JUICEFS_PASSTHROUGH") == "1"
 	if ptEnabled {
 		opt.EnablePassthrough = true
-		opt.MaxStackDepth = 2
+		// Stacking depth the kernel records on this superblock (INIT reply
+		// max_stack_depth). 2 (the kernel maximum) lets backing files live on
+		// a stacked fs but makes this mount un-stackable: overlayfs refuses it
+		// as upper or lower ("maximum fs stacking depth exceeded"). 1 keeps
+		// overlayfs on top possible and requires the staging dir to be on a
+		// plain filesystem, which it should be anyway (a stacked staging fs
+		// only ever negated passthrough). Default 1; JUICEFS_PASSTHROUGH_MAX_STACK_DEPTH=2 restores the old value.
+		opt.MaxStackDepth = 1
+		if v := os.Getenv("JUICEFS_PASSTHROUGH_MAX_STACK_DEPTH"); v == "2" {
+			opt.MaxStackDepth = 2
+		}
 	}
 	fssrv, err := fuse.NewServer(imp, conf.Meta.MountPoint, &opt)
 	if err != nil {
