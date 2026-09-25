@@ -748,8 +748,29 @@ func testMetaClient(t *testing.T, m Meta) {
 	} else if string(entries[0].Name) != "." || string(entries[1].Name) != ".." || string(entries[2].Name) != "f" {
 		t.Fatalf("entries: %+v", entries)
 	}
-	if st := m.Rename(ctx, parent, "f", 1, "f2", RenameWhiteout, &inode, attr); st != syscall.ENOTSUP {
-		t.Fatalf("rename d/f -> f2: %s", st)
+	// RENAME_WHITEOUT: the rename happens and a char 0:0 whiteout is left
+	// at the source name (what overlayfs expects of an upper filesystem).
+	if st := m.Rename(ctx, parent, "f", 1, "f2", RenameWhiteout, &inode, attr); st != 0 {
+		t.Fatalf("rename d/f -> f2 with whiteout: %s", st)
+	}
+	var whInode Ino
+	whAttr := &Attr{}
+	if st := m.Lookup(ctx, parent, "f", &whInode, whAttr, false); st != 0 {
+		t.Fatalf("lookup whiteout d/f: %s", st)
+	} else if whAttr.Typ != TypeCharDev || whAttr.Rdev != 0 {
+		t.Fatalf("whiteout d/f: type %d rdev %d", whAttr.Typ, whAttr.Rdev)
+	}
+	if st := m.Lookup(ctx, 1, "f2", &whInode, whAttr, false); st != 0 || whInode != inode {
+		t.Fatalf("lookup f2 after whiteout rename: %s (%d vs %d)", st, whInode, inode)
+	}
+	if st := m.Rename(ctx, 1, "f2", parent, "f", RenameExchange|RenameWhiteout, &inode, attr); st != syscall.EINVAL {
+		t.Fatalf("rename exchange|whiteout: %s", st)
+	}
+	if st := m.Unlink(ctx, parent, "f"); st != 0 {
+		t.Fatalf("unlink whiteout d/f: %s", st)
+	}
+	if st := m.Rename(ctx, 1, "f2", parent, "f", 0, &inode, attr); st != 0 {
+		t.Fatalf("rename f2 -> d/f: %s", st)
 	}
 	if st := m.Rename(ctx, parent, "f", 1, "f2", 0, &inode, attr); st != 0 {
 		t.Fatalf("rename d/f -> f2: %s", st)

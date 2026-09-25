@@ -1893,11 +1893,18 @@ func (m *baseMeta) Rename(ctx Context, parentSrc Ino, nameSrc string, parentDst 
 		return errno
 	}
 
+	// RENAME_WHITEOUT (overlayfs upper-dir support): do the plain rename,
+	// then leave a whiteout (char 0:0 device) at the source name. Not atomic
+	// with the rename; overlayfs tolerates that the same way it tolerates its
+	// own mknod+rename fallback.
+	whiteout := flags&RenameWhiteout != 0
+	flags &^= RenameWhiteout
 	switch flags {
 	case 0, RenameNoReplace, RenameExchange, RenameNoReplace | RenameRestore:
-	case RenameWhiteout, RenameNoReplace | RenameWhiteout:
-		return syscall.ENOTSUP
 	default:
+		return syscall.EINVAL
+	}
+	if whiteout && flags == RenameExchange {
 		return syscall.EINVAL
 	}
 
@@ -1998,6 +2005,13 @@ func (m *baseMeta) Rename(ctx Context, parentSrc Ino, nameSrc string, parentDst 
 					m.updateDirQuota(ctx, parentSrc, align4K(diffLength), 1)
 				}
 			}
+		}
+	}
+	if st == 0 && whiteout {
+		var wino Ino
+		var wattr Attr
+		if e := m.Mknod(ctx, parentSrc, nameSrc, TypeCharDev, 0, 0, 0, "", &wino, &wattr); e != 0 {
+			return e
 		}
 	}
 	return st
