@@ -31,6 +31,7 @@ import (
 	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/juicedata/juicefs/pkg/vfs"
 	"github.com/zeebo/blake3"
+	"golang.org/x/sys/unix"
 )
 
 // passthroughState manages per-open backing files used for FUSE passthrough
@@ -148,9 +149,10 @@ type ptSyncMark struct {
 	sum  [32]byte
 }
 
-// fingerprintStaging hashes the staging file at path from offset 0 through
-// EOF, the same bytes copyStagingLocked would copy. Opened by path: reading
-// through the registered backing fd can return stale or partial data.
+// fingerprintStaging hashes the staging file at path the same way
+// copyStagingLocked walks it: its data regions (holes skipped) and its size.
+// Opened by path: reading through the registered backing fd can return stale
+// or partial data.
 func fingerprintStaging(path string) (*ptSyncMark, error) {
 	rf, err := os.Open(path)
 	if err != nil {
@@ -158,15 +160,84 @@ func fingerprintStaging(path string) (*ptSyncMark, error) {
 	}
 	defer rf.Close()
 	h := blake3.New()
-	buf := utils.Alloc(4 << 20)
-	defer utils.Free(buf)
-	n, err := io.CopyBuffer(h, rf, buf)
+	size, err := walkStagingData(rf, func(off int64, data []byte) error {
+		hashRegion(h, off, data)
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	m := &ptSyncMark{size: uint64(n)}
+	m := &ptSyncMark{size: uint64(size)}
 	copy(m.sum[:], h.Sum(nil))
 	return m, nil
+}
+
+// hashRegion feeds one data region into the fingerprint with its offset, so
+// the same bytes at a different place (or a hole moved) hash differently.
+func hashRegion(h *blake3.Hasher, off int64, data []byte) {
+	var hdr [8]byte
+	for i := 0; i < 8; i++ {
+		hdr[i] = byte(uint64(off) >> (8 * i))
+	}
+	_, _ = h.Write(hdr[:])
+	_, _ = h.Write(data)
+}
+
+// walkStagingData calls fn for every data region of f in offset order, in
+// chunks of at most 4 MiB, and returns the file size. Holes are skipped with
+// SEEK_DATA/SEEK_HOLE: the staging file is sparse wherever the application
+// never wrote (truncate to extend, mkfs, VM and loop images), and reading
+// those holes back as zeros would write — and upload — every one of them.
+// A filesystem without SEEK_DATA support is walked as one data region. A read
+// error mid-region is returned, never mistaken for end-of-file.
+func walkStagingData(f *os.File, fn func(off int64, data []byte) error) (int64, error) {
+	st, err := f.Stat()
+	if err != nil {
+		return 0, err
+	}
+	size := st.Size()
+	buf := utils.Alloc(4 << 20)
+	defer utils.Free(buf)
+	fd := int(f.Fd())
+	var off int64
+	for off < size {
+		start, end := off, size
+		if s, err := unix.Seek(fd, off, unix.SEEK_DATA); err == nil {
+			start = s
+			if e, err := unix.Seek(fd, start, unix.SEEK_HOLE); err == nil {
+				end = e
+			}
+		} else if err == syscall.ENXIO {
+			break // only a hole remains
+		}
+		if end > size {
+			end = size
+		}
+		for start < end {
+			want := int64(len(buf))
+			if end-start < want {
+				want = end - start
+			}
+			n, err := f.ReadAt(buf[:want], start)
+			if n > 0 {
+				if e := fn(start, buf[:n]); e != nil {
+					return size, e
+				}
+				start += int64(n)
+			}
+			if err != nil {
+				if err == io.EOF && int64(n) == want {
+					continue
+				}
+				if err == io.EOF {
+					return size, fmt.Errorf("staging shrank under the copy at %d (size %d)", start, size)
+				}
+				return size, err
+			}
+		}
+		off = end
+	}
+	return size, nil
 }
 
 // stagingUnchangedLocked reports whether the staging content still matches
@@ -653,15 +724,18 @@ func (p *passthroughState) reconcile(ctx vfs.Context, v *vfs.VFS, fh uint64) {
 	p.retire(b)
 }
 
-// copyStagingLocked copies the full staging content of pf into JuiceFS slices
-// via the normal writer path. Returns the byte count and false on any read or
+// copyStagingLocked copies the staging content of pf into JuiceFS slices via
+// the normal writer path. Returns the file size and false on any read or
 // write error — a read error mid-copy must NOT be mistaken for end-of-file,
 // or the caller would flush+commit a truncated file as if complete. Always a
-// FULL copy from offset 0: passthrough writes land in the backing at
+// FULL walk from offset 0: passthrough writes land in the backing at
 // arbitrary offsets, so an incremental "since last copy" scheme would miss
-// overwrites of already-copied ranges. Also returns the blake3 fingerprint of
-// the bytes copied, so an fsync-time copy can record what is now in slices
-// and a later copy can be skipped if the staging has not changed since.
+// overwrites of already-copied ranges. Holes are skipped (see
+// walkStagingData); the file is empty in JuiceFS when passthrough opens it,
+// so a hole there already reads as zeros. Also returns the blake3
+// fingerprint of what was copied, so an fsync-time copy can record what is
+// now in slices and a later copy can be skipped if the staging has not
+// changed since.
 // Caller holds pf.b.mu.
 func (p *passthroughState) copyStagingLocked(ctx vfs.Context, v *vfs.VFS, pf *ptFile) (uint64, [32]byte, bool) {
 	var sum [32]byte
@@ -672,39 +746,37 @@ func (p *passthroughState) copyStagingLocked(ctx vfs.Context, v *vfs.VFS, pf *pt
 	}
 	defer rf.Close()
 	h := blake3.New()
-	// Pooled/accounted allocation: vfs.writer's and vfs/compact's memory
-	// backpressure (utils.AllocMemory()-store.UsedMemory()) only sees bytes
-	// allocated through utils.Alloc. A raw make() here would be invisible to
-	// that accounting, so concurrent reconciles could balloon RSS well past
-	// the configured buffer budget without the compactor/writer ever
-	// throttling in response.
-	buf := utils.Alloc(4 << 20)
-	defer utils.Free(buf)
-	var off uint64
-	for {
-		n, err := rf.Read(buf)
-		if n > 0 {
-			// vfs.Write may retain the buffer until flush; give each chunk its
-			// own backing array so the next Read doesn't corrupt a pending slice.
-			chunk := make([]byte, n)
-			copy(chunk, buf[:n])
-			_, _ = h.Write(chunk)
-			if e := v.Write(ctx, pf.ino, chunk, off, pf.fh); e != 0 {
-				logger.Errorf("passthrough: staging copy write ino %d off %d: %s", pf.ino, off, e)
-				return off, sum, false
-			}
-			off += uint64(n)
+	var dataEnd uint64
+	size, err := walkStagingData(rf, func(off int64, data []byte) error {
+		// vfs.Write may retain the buffer until flush; give each chunk its
+		// own backing array so the next read doesn't corrupt a pending slice.
+		// (walkStagingData's buffer is pooled/accounted: vfs.writer's memory
+		// backpressure only sees bytes allocated through utils.Alloc.)
+		chunk := make([]byte, len(data))
+		copy(chunk, data)
+		hashRegion(h, off, chunk)
+		if e := v.Write(ctx, pf.ino, chunk, uint64(off), pf.fh); e != 0 {
+			return fmt.Errorf("write off %d: %s", off, e)
 		}
-		if err != nil {
-			if err != io.EOF {
-				logger.Errorf("passthrough: read staging %s at off %d: %s", pf.b.path, off, err)
-				return off, sum, false
-			}
-			break
+		dataEnd = uint64(off) + uint64(len(chunk))
+		return nil
+	})
+	if err != nil {
+		logger.Errorf("passthrough: staging copy ino %d from %s: %s", pf.ino, pf.b.path, err)
+		return dataEnd, sum, false
+	}
+	// A trailing hole wrote nothing, so writes alone leave the length short.
+	// The length is normally already right — truncate(2) reaches the daemon
+	// and sets it (see truncate) — but make it authoritative from the staging
+	// size rather than rely on that ordering.
+	if uint64(size) > dataEnd {
+		if e := v.Truncate(ctx, pf.ino, size, pf.fh, nil); e != 0 {
+			logger.Errorf("passthrough: set length of ino %d to %d: %s", pf.ino, size, e)
+			return dataEnd, sum, false
 		}
 	}
 	copy(sum[:], h.Sum(nil))
-	return off, sum, true
+	return uint64(size), sum, true
 }
 
 // fsync makes fsync(2)/fdatasync(2) honest for a passthrough open. The
