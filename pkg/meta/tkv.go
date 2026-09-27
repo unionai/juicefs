@@ -134,15 +134,22 @@ func (m *kvMeta) Shutdown() error {
 // checkpointableKV is an optional capability of tkv clients that can
 // produce a consistent local snapshot (currently BadgerDB).
 type checkpointableKV interface {
-	checkpointTo(dst string) error
+	checkpointTo(dst string, pinned func()) error
 }
 
 func (m *kvMeta) CheckpointStore(ctx Context, dst string) error {
+	return m.CheckpointStorePinned(ctx, dst, nil)
+}
+
+// CheckpointStorePinned is CheckpointStore that also calls pinned (if set)
+// once the snapshot's content is fixed, before the slow part of writing it
+// out; see PinnedCheckpointer.
+func (m *kvMeta) CheckpointStorePinned(ctx Context, dst string, pinned func()) error {
 	c, ok := m.client.(checkpointableKV)
 	if !ok {
 		return syscall.ENOTSUP
 	}
-	return c.checkpointTo(dst)
+	return c.checkpointTo(dst, pinned)
 }
 
 // restorableKV is an optional capability of tkv clients that can populate

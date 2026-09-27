@@ -569,6 +569,15 @@ type Meta interface {
 	ScanChangelog(ctx Context, last int64, handler func(ver int64, entry string) error) error
 }
 
+// PinnedCheckpointer is implemented by engines whose CheckpointStore can say
+// when the snapshot's content became fixed. pinned is called once, before the
+// snapshot is written out; anything that happens after it is not in the
+// snapshot. A caller that holds writers back so the snapshot includes (or
+// excludes) them can release them there instead of when the write finishes.
+type PinnedCheckpointer interface {
+	CheckpointStorePinned(ctx Context, dst string, pinned func()) error
+}
+
 type CheckOpt struct {
 	Repair        bool
 	Recursive     bool

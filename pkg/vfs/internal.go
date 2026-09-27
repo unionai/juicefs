@@ -371,7 +371,23 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, o
 				return
 			}
 			logger.Infof("checkpoint: snapshotting metadata store to %s", dst)
-			if err := v.Meta.CheckpointStore(ctx, dst); err != nil {
+			start := time.Now()
+			var err error
+			if pc, ok := v.Meta.(meta.PinnedCheckpointer); ok {
+				// The quiesce could end at the pin — a reconcile admitted
+				// after it lands after the snapshot either way — but the
+				// drain below counts every staged block, so reconciles let in
+				// here would extend it. It holds until the drain is done.
+				err = pc.CheckpointStorePinned(ctx, dst, func() {
+					logger.Infof("checkpoint: snapshot pinned after %s", time.Since(start))
+				})
+			} else {
+				err = v.Meta.CheckpointStore(ctx, dst)
+			}
+			if err == nil {
+				logger.Infof("checkpoint: snapshot written in %s", time.Since(start))
+			}
+			if err != nil {
 				logger.Errorf("checkpoint: snapshot store: %s", err)
 				if err == syscall.ENOTSUP {
 					st = syscall.ENOTSUP

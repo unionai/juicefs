@@ -25,11 +25,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"sync/atomic"
 	"time"
 
 	"github.com/dgraph-io/badger/v4"
+	"github.com/dgraph-io/badger/v4/pb"
+	"github.com/dgraph-io/badger/v4/y"
 	"github.com/dgraph-io/ristretto/v2/z"
 	"github.com/juicedata/juicefs/pkg/utils"
 )
@@ -160,9 +163,13 @@ type badgerClient struct {
 // checkpoint, which nothing is waiting on. Restores still accept the old
 // format; see restoreFrom.
 //
-// Consistency comes from Stream, which iterates at a single read timestamp,
-// so this is safe against a live client that keeps writing throughout.
-func (c *badgerClient) checkpointTo(dst string) error {
+// The snapshot is point-in-time: it is read through one read-only
+// transaction, so it is safe against a live client that keeps writing
+// throughout. pinned, if set, is called as soon as that transaction exists —
+// from then on, writes can no longer change what the snapshot contains, so a
+// caller holding writers back only for the snapshot's sake can let them go
+// without waiting for the copy.
+func (c *badgerClient) checkpointTo(dst string, pinned func()) error {
 	// Next to dst, so the archive is a rename away from its final home and
 	// the caller's choice of filesystem (and free space) governs both.
 	tmp, err := os.MkdirTemp(filepath.Dir(dst), ".badger-checkpoint-")
@@ -170,21 +177,32 @@ func (c *badgerClient) checkpointTo(dst string) error {
 		return err
 	}
 	defer os.RemoveAll(tmp)
-	if err := c.copyTo(tmp); err != nil {
+	if err := c.copyTo(tmp, pinned); err != nil {
 		return err
 	}
 	return tarDirectory(tmp, dst)
 }
 
+// checkpointWorkers is how many key ranges copyTo reads at once.
+const checkpointWorkers = 4
+
 // copyTo builds a standalone, fully compacted Badger directory at dir from a
 // consistent snapshot of this store.
 //
-// Stream reads at one timestamp and StreamWriter writes SSTs directly rather
-// than inserting through the LSM, so the copy is both point-in-time and
-// cheaper than a dump/replay round trip. The result holds one table level of
-// sorted data: smaller than the source (no overwritten versions, no deleted
-// keys) and with no compaction debt for whoever opens it next.
-func (c *badgerClient) copyTo(dir string) (err error) {
+// Every key is read through ONE read-only transaction, which is what makes
+// the copy point-in-time. Badger's own Stream cannot be used for this on a
+// non-managed DB: each of its producer goroutines opens its own transaction,
+// so a copy with NumGo > 1 mixes read timestamps, and a transaction that
+// commits while they start can land half in the copy. (Measured: 57 torn
+// two-key transactions across 20 copies of a store under a live writer.)
+// Several iterators over the one transaction keep the parallelism.
+//
+// The copy keeps only each key's latest visible version and writes SSTs
+// directly through a StreamWriter rather than inserting through the LSM, so
+// the result holds one table level of sorted data: smaller than the source
+// (no overwritten versions, no deleted keys) and with no compaction debt for
+// whoever opens it next.
+func (c *badgerClient) copyTo(dir string, pinned func()) (err error) {
 	opt := badger.DefaultOptions(dir)
 	opt.Logger = utils.GetLogger("badger")
 	opt.MetricsEnabled = false
@@ -221,14 +239,45 @@ func (c *badgerClient) copyTo(dir string) (err error) {
 		}
 	}()
 
-	st := c.client.NewStream()
-	st.LogPrefix = "badger.checkpoint"
-	// Four producers keep the copy comfortably ahead of the tar that follows
-	// without holding eight table builders' worth of buffers at once.
-	st.NumGo = 4
-	st.MaxSize = 32 << 20
-	st.Send = func(buf *z.Buffer) error { return sw.Write(buf) }
-	if err = st.Orchestrate(context.Background()); err != nil {
+	txn := c.client.NewTransaction(false)
+	defer txn.Discard()
+	if pinned != nil {
+		pinned()
+	}
+
+	bounds := c.splitKeys(checkpointWorkers * 4)
+	ranges := make(chan int, len(bounds)+1)
+	for i := 0; i <= len(bounds); i++ {
+		ranges <- i
+	}
+	close(ranges)
+	errs := make(chan error, checkpointWorkers)
+	for w := 0; w < checkpointWorkers; w++ {
+		go func() {
+			for i := range ranges {
+				var lo, hi []byte
+				if i > 0 {
+					lo = bounds[i-1]
+				}
+				if i < len(bounds) {
+					hi = bounds[i]
+				}
+				// StreamWriter wants each stream's keys in order and gives
+				// every stream its own tables; one stream per range does both.
+				if err := copyRange(txn, sw, uint32(i+1), lo, hi); err != nil {
+					errs <- err
+					return
+				}
+			}
+			errs <- nil
+		}()
+	}
+	for w := 0; w < checkpointWorkers; w++ {
+		if e := <-errs; e != nil && err == nil {
+			err = e
+		}
+	}
+	if err != nil {
 		return err
 	}
 	if err = sw.Flush(); err != nil {
@@ -236,6 +285,86 @@ func (c *badgerClient) copyTo(dir string) (err error) {
 	}
 	flushed = true
 	return nil
+}
+
+// copyRange copies the latest visible version of every key in [lo, hi) —
+// nil meaning unbounded — as stream id into sw, in 32 MiB batches.
+func copyRange(txn *badger.Txn, sw *badger.StreamWriter, id uint32, lo, hi []byte) error {
+	it := txn.NewIterator(badger.IteratorOptions{PrefetchValues: true, PrefetchSize: 256})
+	defer it.Close()
+	buf := z.NewBuffer(64<<20, "badger.checkpoint")
+	defer func() { _ = buf.Release() }()
+	send := func() error {
+		if buf.LenNoPadding() == 0 {
+			return nil
+		}
+		err := sw.Write(buf)
+		_ = buf.Release()
+		buf = z.NewBuffer(64<<20, "badger.checkpoint")
+		return err
+	}
+	for it.Seek(lo); it.Valid(); it.Next() {
+		item := it.Item()
+		if hi != nil && bytes.Compare(item.Key(), hi) >= 0 {
+			break
+		}
+		v, err := item.ValueCopy(nil)
+		if err != nil {
+			return err
+		}
+		badger.KVToBuffer(&pb.KV{
+			Key:       item.KeyCopy(nil),
+			Value:     v,
+			UserMeta:  []byte{item.UserMeta()},
+			Version:   item.Version(),
+			ExpiresAt: item.ExpiresAt(),
+			StreamId:  id,
+		}, buf)
+		if buf.LenNoPadding() >= 32<<20 {
+			if err := send(); err != nil {
+				return err
+			}
+		}
+	}
+	return send()
+}
+
+// splitKeys picks up to n-1 sorted, distinct user keys that cut the store
+// into roughly equal ranges by on-disk size, from the tables' key bounds.
+// Balance only: the ranges they define always cover the whole keyspace, and
+// data still in memtables lands in whichever range holds its key.
+func (c *badgerClient) splitKeys(n int) [][]byte {
+	type bound struct {
+		key  []byte
+		size uint64
+	}
+	var bs []bound
+	var total uint64
+	for _, t := range c.client.Tables() {
+		k := y.ParseKey(t.Right)
+		if len(k) == 0 || bytes.HasPrefix(k, []byte("!badger!")) {
+			continue
+		}
+		bs = append(bs, bound{k, uint64(t.OnDiskSize)})
+		total += uint64(t.OnDiskSize)
+	}
+	sort.Slice(bs, func(i, j int) bool { return bytes.Compare(bs[i].key, bs[j].key) < 0 })
+	var out [][]byte
+	var acc uint64
+	for _, b := range bs {
+		acc += b.size
+		if uint64(len(out)+1)*total/uint64(n) > acc {
+			continue
+		}
+		if len(out) > 0 && bytes.Equal(out[len(out)-1], b.key) {
+			continue
+		}
+		if len(out) == n-1 {
+			break
+		}
+		out = append(out, b.key)
+	}
+	return out
 }
 
 // restoreFrom loads a legacy Badger *backup stream* into this store. The DB
