@@ -339,6 +339,14 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, o
 		// non-durable chunks.
 		drainTimeout := time.Duration(r.Get32()) * time.Second
 		dst := string(r.Get(int(r.Get32())))
+		// Optional trailing flags (bit 0: skip the drain). A caller that skips
+		// it owns confirming the drain before publishing the snapshot; it does
+		// so to release a filesystem freeze between the snapshot and the
+		// upload wait (block-mode volumes).
+		skipDrain := false
+		if r.HasMore() {
+			skipDrain = r.Get8()&1 != 0
+		}
 		done := make(chan struct{})
 		var remain uint64
 		var st syscall.Errno
@@ -378,6 +386,10 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, o
 				} else {
 					st = syscall.EIO
 				}
+				return
+			}
+			if skipDrain {
+				logger.Infof("checkpoint: snapshot at %s written; drain skipped by request", dst)
 				return
 			}
 			for {

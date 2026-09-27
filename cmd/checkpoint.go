@@ -61,6 +61,13 @@ $ juicefs checkpoint badger:///var/lib/vol/meta /var/lib/vol/checkpoint.bak`,
 				Value: 600,
 				Usage: "seconds to wait for the writeback staging queue to drain",
 			},
+			&cli.BoolFlag{
+				Name: "skip-drain",
+				Usage: "return as soon as the snapshot is written, without waiting for the writeback " +
+					"queue; DST then references blocks that may still be staging, so the caller must " +
+					"confirm the drain itself before publishing it (lets a caller release a filesystem " +
+					"freeze between the snapshot and the upload drain)",
+			},
 		},
 	}
 }
@@ -91,12 +98,21 @@ func checkpoint(ctx *cli.Context) error {
 	}
 	defer f.Close()
 
-	wb := utils.NewBuffer(8 + 4 + 4 + uint32(len(dst)))
+	// A trailing flags byte (bit 0: skip the drain). Optional on the wire:
+	// an older client omits it and the daemon drains; an older daemon
+	// ignores it and drains anyway, which is the safe direction.
+	skipDrain := ctx.Bool("skip-drain")
+	wb := utils.NewBuffer(8 + 4 + 4 + uint32(len(dst)) + 1)
 	wb.Put32(meta.Checkpoint)
-	wb.Put32(4 + 4 + uint32(len(dst)))
+	wb.Put32(4 + 4 + uint32(len(dst)) + 1)
 	wb.Put32(uint32(ctx.Uint("drain-timeout")))
 	wb.Put32(uint32(len(dst)))
 	wb.Put([]byte(dst))
+	var flags uint8
+	if skipDrain {
+		flags |= 1
+	}
+	wb.Put8(flags)
 	if _, err = f.Write(wb.Bytes()); err != nil {
 		logger.Fatalf("write message: %s", err)
 	}
@@ -108,6 +124,10 @@ func checkpoint(ctx *cli.Context) error {
 		logger.Fatalf("checkpoint %s -> %s: %s", mp, dst, errno)
 	}
 	progress.Done()
-	logger.Infof("checkpoint written to %s (writeback drained)", dst)
+	if skipDrain {
+		logger.Infof("checkpoint written to %s (drain skipped: confirm the writeback drain before publishing it)", dst)
+	} else {
+		logger.Infof("checkpoint written to %s (writeback drained)", dst)
+	}
 	return nil
 }
