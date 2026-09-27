@@ -18,6 +18,7 @@ package cmd
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -37,10 +38,17 @@ func cmdCheckpoint() *cli.Command {
 With a MOUNTPOINT, asks the running client to (1) flush all buffered
 writes, (2) write an engine-native consistent snapshot of the metadata
 store to DST (a local path on the machine running the client), and (3)
-wait until the writeback staging queue has fully drained to object
-storage. The drain runs after the snapshot, so every chunk the snapshot
-references is durable when this command returns 0 — DST can then be
-published as a branch/commit index.
+wait until every block the snapshot references has been uploaded to object
+storage. Blocks written after the snapshot are not waited for, so a busy
+writer cannot keep the drain going. Every chunk the snapshot references is
+durable when this command returns 0 — DST can then be published as a
+branch/commit index.
+
+As soon as the snapshot's content is fixed, before it is written out and
+before the drain, the command prints "snapshot pinned" on stdout: from then
+on nothing written to the file system can change what DST contains, so a
+caller holding writers back for the snapshot (a frozen file system) can let
+them go.
 
 With a META-URL, snapshots an UNMOUNTED store directly (no drain — there
 is no client, so nothing can be staged). This is how directory-shaped
@@ -102,8 +110,14 @@ func checkpoint(ctx *cli.Context) error {
 	}
 	progress := utils.NewProgress(false)
 	spin := progress.AddCountSpinner("Staged blocks pending")
-	if _, errno := readProgress(f, func(count, bytes uint64) {
+	announced := false
+	if _, errno := readProgress(f, func(count, pinned uint64) {
 		spin.SetCurrent(int64(count))
+		if pinned != 0 && !announced {
+			announced = true
+			fmt.Println("snapshot pinned")
+			_ = os.Stdout.Sync()
+		}
 	}); errno != 0 {
 		logger.Fatalf("checkpoint %s -> %s: %s", mp, dst, errno)
 	}
