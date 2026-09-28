@@ -641,6 +641,8 @@ func Serve(v *vfs.VFS, options string, xattrs, ioctl bool) error {
 	}
 
 	fsserv = fssrv
+	stopBrokerSession := holdBrokerSession()
+	defer stopBrokerSession()
 	fssrv.Serve()
 	// The kernel delivers queued RELEASEs before tearing the session down,
 	// but their passthrough reconciles may still be copying staging data
