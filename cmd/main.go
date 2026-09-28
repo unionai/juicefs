@@ -82,6 +82,7 @@ func Main(args []string) error {
 			cmdWarmup(),
 			cmdRmr(),
 			cmdCheckpoint(),
+			cmdCheckpointConfirm(),
 			cmdCheckpointRestore(),
 			cmdSliceRefs(),
 			cmdSync(),

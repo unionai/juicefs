@@ -134,15 +134,55 @@ func (m *kvMeta) Shutdown() error {
 // checkpointableKV is an optional capability of tkv clients that can
 // produce a consistent local snapshot (currently BadgerDB).
 type checkpointableKV interface {
-	checkpointTo(dst string) error
+	checkpointTo(dst string, pinned func()) error
 }
 
 func (m *kvMeta) CheckpointStore(ctx Context, dst string) error {
+	return m.CheckpointStorePinned(ctx, dst, nil)
+}
+
+// CheckpointStorePinned is CheckpointStore that also calls pinned (if set)
+// once the snapshot's content is fixed, before the slow part of writing it
+// out; see PinnedCheckpointer.
+func (m *kvMeta) CheckpointStorePinned(ctx Context, dst string, pinned func()) error {
 	c, ok := m.client.(checkpointableKV)
 	if !ok {
 		return syscall.ENOTSUP
 	}
-	return c.checkpointTo(dst)
+	return c.checkpointTo(dst, pinned)
+}
+
+// deltaCheckpointableKV is an optional capability of tkv clients that can
+// write delta checkpoints (currently BadgerDB; see badger_delta.go).
+type deltaCheckpointableKV interface {
+	checkpointableKV
+	checkpointFullTo(dst string, pinned func()) (readTs uint64, err error)
+	checkpointDeltaTo(dst string, pinned func()) (base, readTs uint64, err error)
+	confirmCheckpoint(ts uint64) error
+}
+
+func (m *kvMeta) CheckpointStoreFullPinned(ctx Context, dst string, pinned func()) (uint64, error) {
+	c, ok := m.client.(deltaCheckpointableKV)
+	if !ok {
+		return 0, syscall.ENOTSUP
+	}
+	return c.checkpointFullTo(dst, pinned)
+}
+
+func (m *kvMeta) CheckpointStoreDeltaPinned(ctx Context, dst string, pinned func()) (uint64, uint64, error) {
+	c, ok := m.client.(deltaCheckpointableKV)
+	if !ok {
+		return 0, 0, syscall.ENOTSUP
+	}
+	return c.checkpointDeltaTo(dst, pinned)
+}
+
+func (m *kvMeta) ConfirmCheckpoint(ctx Context, readTs uint64) error {
+	c, ok := m.client.(deltaCheckpointableKV)
+	if !ok {
+		return syscall.ENOTSUP
+	}
+	return c.confirmCheckpoint(readTs)
 }
 
 // restorableKV is an optional capability of tkv clients that can populate

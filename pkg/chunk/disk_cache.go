@@ -431,9 +431,11 @@ func (cache *cacheStore) removeStage(key string) error {
 	if err = cache.removeFile(cache.stagePath(key)); err == nil {
 		cache.m.stageBlocks.Sub(1)
 		cache.m.stageBlockBytes.Sub(float64(parseObjOrigSize(key)))
+		ledger.remove(key)
 	}
 	// ignore ENOENT error
 	if err != nil && os.IsNotExist(err) {
+		ledger.remove(key)
 		return nil
 	}
 	return err
@@ -782,6 +784,7 @@ func (cache *cacheStore) stage(key string, data []byte, tierID uint8) (string, e
 	defer stagingBlocks.Add(-1)
 	err := cache.flushPage(stagingPath, data, false, tierID)
 	if err == nil {
+		ledger.add(key, stagingPath)
 		cache.m.stageBlocks.Add(1)
 		cache.m.stageBlockBytes.Add(float64(len(data)))
 		cache.m.stageWriteBytes.Add(float64(len(data)))
@@ -1044,6 +1047,7 @@ func (cache *cacheStore) scanStaging() {
 				return nil
 			}
 			logger.Debugf("Found staging block: %s", path)
+			ledger.add(key, path)
 			cache.m.stageBlocks.Add(1)
 			cache.m.stageBlockBytes.Add(float64(origSize))
 			cache.uploader(key, path, false)

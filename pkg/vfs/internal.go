@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strconv"
@@ -29,6 +30,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/juicedata/juicefs/pkg/chunk"
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/object"
 	"github.com/juicedata/juicefs/pkg/utils"
@@ -331,77 +333,52 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, o
 		}
 		_, _ = out.Write([]byte{uint8(st)})
 	case meta.Checkpoint:
-		// Flush dirty pages -> snapshot the metadata store -> drain the
-		// writeback staging queue. The drain runs AFTER the snapshot so it
-		// covers exactly the blocks the snapshot references (every slice in
-		// the snapshot was staged before the snapshot was taken); a snapshot
-		// published after a successful drain therefore never references
-		// non-durable chunks.
 		drainTimeout := time.Duration(r.Get32()) * time.Second
 		dst := string(r.Get(int(r.Get32())))
+		// Optional flags (newer callers): checkpointFlagDelta asks for a delta
+		// checkpoint, checkpointFlagResult for a JSON result (kind, base,
+		// read_ts) in place of the status byte on success.
+		var flags uint8
+		if r.HasMore() {
+			flags = r.Get8()
+		}
 		done := make(chan struct{})
-		var remain uint64
+		// Progress frames carry (blocks still to drain, pinned): pinned turns
+		// 1 once the snapshot's content is fixed, so a caller holding its
+		// writers back (e.g. a frozen filesystem) can let them go then
+		// instead of after the drain. Older callers ignore the second value.
+		var remain, pinned uint64
 		var st syscall.Errno
+		var res checkpointResult
 		go func() {
 			defer close(done)
-			deadline := time.Now().Add(drainTimeout)
-			// Wait out in-flight out-of-band flushes (passthrough staging
-			// reconciles) first, AND block new ones from starting until the
-			// snapshot below is taken: those files' close(2) already
-			// returned, so the snapshot MUST include them, but their writes
-			// only become visible to FlushAll when the reconcile completes.
-			// A plain "poll until ExternalFlushes()==0" is a TOCTOU — a new
-			// reconcile could start in the gap between the poll succeeding
-			// and CheckpointStore actually running, and its write would land
-			// either just before or just after the snapshot depending on
-			// scheduling, silently violating the read-your-writes contract
-			// for a close(2) that already returned. QuiesceExternalFlushes
-			// closes that gap by refusing new admissions before it starts
-			// waiting, same as passthroughState.drain() does for handover.
-			if !v.QuiesceExternalFlushes(deadline) {
-				logger.Errorf("checkpoint: timed out waiting for in-flight external flush(es)")
-				st = syscall.ETIMEDOUT
-				return
-			}
-			defer v.EndQuiesceExternalFlushes()
-			logger.Infof("checkpoint: flushing buffered data")
-			if err := v.FlushAll(""); err != nil {
-				logger.Errorf("checkpoint: flush: %s", err)
-				st = syscall.EIO
-				return
-			}
-			logger.Infof("checkpoint: snapshotting metadata store to %s", dst)
-			if err := v.Meta.CheckpointStore(ctx, dst); err != nil {
-				logger.Errorf("checkpoint: snapshot store: %s", err)
-				if err == syscall.ENOTSUP {
-					st = syscall.ENOTSUP
-				} else {
-					st = syscall.EIO
-				}
-				return
-			}
-			for {
-				n, err := v.stagingBlocks()
-				if err != nil {
-					logger.Errorf("checkpoint: staging unobservable: %s", err)
-					st = syscall.EIO
-					return
-				}
-				atomic.StoreUint64(&remain, n)
-				if n == 0 {
-					logger.Infof("checkpoint: writeback staging drained; snapshot at %s is durable", dst)
-					return
-				}
-				if time.Now().After(deadline) {
-					logger.Errorf("checkpoint: drain timed out with %d block(s) staged", n)
-					st = syscall.ETIMEDOUT
-					return
-				}
-				time.Sleep(time.Millisecond * 500)
-			}
+			res, st = v.checkpointAndDrainMode(ctx, dst, flags&checkpointFlagDelta != 0, time.Now().Add(drainTimeout), &remain, &pinned)
 		}()
-		writeProgress(&remain, nil, out, done)
-		_, _ = out.Write([]byte{uint8(st)})
+		writeProgress(&remain, &pinned, out, done)
+		if st != 0 || flags&checkpointFlagResult == 0 {
+			_, _ = out.Write([]byte{uint8(st)})
+			break
+		}
+		data, _ := json.Marshal(res)
+		w := utils.NewBuffer(uint32(1 + 4 + len(data)))
+		w.Put8(meta.CDATA)
+		w.Put32(uint32(len(data)))
+		w.Put(data)
+		_, _ = out.Write(w.Bytes())
+	case meta.CheckpointConfirm:
+		ts := r.Get64()
+		dc, ok := v.Meta.(meta.DeltaCheckpointer)
+		if !ok {
+			_, _ = out.Write([]byte{uint8(syscall.ENOTSUP)})
+			break
+		}
+		if err := dc.ConfirmCheckpoint(ctx, ts); err != nil {
+			logger.Warnf("checkpoint: confirm %d: %s", ts, err)
+			_, _ = out.Write([]byte{uint8(syscall.ENOENT)})
+			break
+		}
+		logger.Infof("checkpoint: %d confirmed as the delta base", ts)
+		_, _ = out.Write([]byte{0})
 	case meta.Clone:
 		done := make(chan struct{})
 		srcIno := Ino(r.Get64())
@@ -702,23 +679,117 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, o
 // object storage (staged + uploading), read from the in-process metrics
 // registry — the authoritative source behind the .stats file. Zero when
 // writeback is off (no such gauges registered).
-func (v *VFS) stagingBlocks() (uint64, error) {
-	if v.registry == nil {
-		return 0, fmt.Errorf("no metrics registry")
-	}
-	mfs, err := v.registry.Gather()
-	if err != nil {
-		return 0, err
-	}
-	var total float64
-	for _, mf := range mfs {
-		name := mf.GetName()
-		if !strings.Contains(name, "staging_blocks") && !strings.Contains(name, "staging_writing_blocks") {
-			continue
-		}
-		for _, m := range mf.GetMetric() {
-			total += m.GetGauge().GetValue()
-		}
-	}
-	return uint64(total), nil
+// checkpointAndDrain flushes buffered data, snapshots the metadata store to
+// dst, then waits until every block the snapshot references has reached
+// object storage, so a published snapshot never references a chunk that
+// exists only on this node's disk.
+//
+// Writers are held back only as long as the snapshot needs them to be. Out-
+// of-band flushes (passthrough reconciles) are quiesced before the flush —
+// those files' close(2) already returned, so the snapshot must include them —
+// and admitted again as soon as the snapshot is pinned, when an engine can
+// say so (meta.PinnedCheckpointer); otherwise at the end. The drain waits for
+// the blocks staged up to the pin (chunk.StagingMark) and not for the ones
+// written after it, which a busy writer keeps adding: a slice reaches the
+// metadata engine only after its blocks are staged, so the snapshot cannot
+// reference a block staged later. *remain tracks the blocks still to drain
+// and *pinned turns 1 at the pin.
+const (
+	checkpointFlagDelta  uint8 = 1
+	checkpointFlagResult uint8 = 2
+)
+
+// checkpointResult identifies a written checkpoint to the caller: Kind is
+// "full" or "delta", ReadTs is what to confirm once it is published, and
+// Base (deltas) the confirmed checkpoint it was taken against.
+type checkpointResult struct {
+	Kind   string `json:"kind"`
+	Base   uint64 `json:"base,omitempty"`
+	ReadTs uint64 `json:"read_ts,omitempty"`
 }
+
+func (v *VFS) checkpointAndDrain(ctx meta.Context, dst string, deadline time.Time, remain, pinned *uint64) syscall.Errno {
+	_, st := v.checkpointAndDrainMode(ctx, dst, false, deadline, remain, pinned)
+	return st
+}
+
+// checkpointAndDrainMode is checkpointAndDrain for a full or (delta) a delta
+// checkpoint. Engines that can confirm checkpoints (meta.DeltaCheckpointer)
+// report the checkpoint's read timestamp; a delta on any other engine, or
+// with no confirmed base (ENOENT), is refused.
+func (v *VFS) checkpointAndDrainMode(ctx meta.Context, dst string, delta bool, deadline time.Time, remain, pinned *uint64) (checkpointResult, syscall.Errno) {
+	res := checkpointResult{Kind: "full"}
+	dc, canConfirm := v.Meta.(meta.DeltaCheckpointer)
+	if delta && !canConfirm {
+		return res, syscall.ENOTSUP
+	}
+	if !v.QuiesceExternalFlushes(deadline) {
+		logger.Errorf("checkpoint: timed out waiting for in-flight external flush(es)")
+		return res, syscall.ETIMEDOUT
+	}
+	var endQuiesce sync.Once
+	release := func() { endQuiesce.Do(v.EndQuiesceExternalFlushes) }
+	defer release()
+	logger.Infof("checkpoint: flushing buffered data")
+	if err := v.FlushAll(""); err != nil {
+		logger.Errorf("checkpoint: flush: %s", err)
+		return res, syscall.EIO
+	}
+	logger.Infof("checkpoint: snapshotting metadata store to %s", dst)
+	start := time.Now()
+	var mark uint64
+	onPin := func() {
+		mark = chunk.StagingMark()
+		release()
+		atomic.StoreUint64(pinned, 1)
+		logger.Infof("checkpoint: snapshot pinned after %s", time.Since(start))
+	}
+	var err error
+	switch {
+	case delta:
+		res.Kind = "delta"
+		res.Base, res.ReadTs, err = dc.CheckpointStoreDeltaPinned(ctx, dst, onPin)
+	case canConfirm:
+		res.ReadTs, err = dc.CheckpointStoreFullPinned(ctx, dst, onPin)
+	default:
+		if pc, ok := v.Meta.(meta.PinnedCheckpointer); ok {
+			err = pc.CheckpointStorePinned(ctx, dst, onPin)
+		} else {
+			err = v.Meta.CheckpointStore(ctx, dst)
+		}
+	}
+	if err == nil && atomic.LoadUint64(pinned) == 0 {
+		// No pin to go by (an engine without one, or one that never called
+		// it): the whole snapshot call is the window, and a mark taken now
+		// covers everything it can reference. Never drain against mark 0,
+		// which would declare the snapshot durable without waiting.
+		onPin()
+	}
+	if err != nil {
+		logger.Errorf("checkpoint: snapshot store: %s", err)
+		switch {
+		case errors.Is(err, meta.ErrNoDeltaBase):
+			return res, syscall.ENOENT
+		case err == syscall.ENOTSUP:
+			return res, syscall.ENOTSUP
+		}
+		return res, syscall.EIO
+	}
+	logger.Infof("checkpoint: snapshot written in %s", time.Since(start))
+	for {
+		n := uint64(chunk.PendingStagedThrough(mark))
+		atomic.StoreUint64(remain, n)
+		if n == 0 {
+			logger.Infof("checkpoint: every block the snapshot references is uploaded; snapshot at %s is durable (drained in %s)", dst, time.Since(start))
+			return res, 0
+		}
+		if time.Now().After(deadline) {
+			logger.Errorf("checkpoint: drain timed out with %d block(s) the snapshot references still staged", n)
+			return res, syscall.ETIMEDOUT
+		}
+		time.Sleep(checkpointDrainPoll)
+	}
+}
+
+// checkpointDrainPoll is how often checkpointAndDrain re-counts staged blocks.
+var checkpointDrainPoll = 500 * time.Millisecond

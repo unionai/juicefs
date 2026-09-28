@@ -20,9 +20,13 @@
 package meta
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
+
+	"github.com/dgraph-io/badger/v4"
 )
 
 // Artifacts published before the archive format are Badger backup streams,
@@ -80,5 +84,97 @@ func TestRestoreStoreBadgerLegacyStream(t *testing.T) {
 	}
 	if inode2 != inode {
 		t.Fatalf("restored inode mismatch: %d != %d", inode2, inode)
+	}
+}
+
+// A checkpoint must be one point in time even while the store is written
+// across its whole keyspace. Every writer transaction sets the same value on
+// a key at each end of the keyspace, so a copy assembled from more than one
+// read timestamp shows a pair that disagrees. Badger's Stream, which this
+// once used, opens a transaction per producer goroutine and does exactly
+// that; this fails against it within a few rounds.
+func TestCheckpointStoreBadgerIsPointInTime(t *testing.T) {
+	tmp := t.TempDir()
+	m, err := newKVMeta("badger", filepath.Join(tmp, "src"), testConfig())
+	if err != nil {
+		t.Fatalf("create meta: %s", err)
+	}
+	db := m.(*kvMeta).client.(*badgerClient).client
+	// Filler across the keyspace, so the copy is split into several ranges.
+	wb := db.NewWriteBatch()
+	for i := 0; i < 1_000_000; i++ {
+		if err := wb.Set([]byte(fmt.Sprintf("m/%09d", i)), make([]byte, 64)); err != nil {
+			t.Fatalf("filler: %s", err)
+		}
+	}
+	if err := wb.Flush(); err != nil {
+		t.Fatalf("filler: %s", err)
+	}
+
+	const pairs = 64
+	var n uint64
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			n++
+			v := []byte(strconv.FormatUint(n, 10))
+			p := n % pairs
+			_ = db.Update(func(txn *badger.Txn) error {
+				if err := txn.Set([]byte(fmt.Sprintf("a/%02d", p)), v); err != nil {
+					return err
+				}
+				return txn.Set([]byte(fmt.Sprintf("z/%02d", p)), v)
+			})
+		}
+	}()
+	defer func() {
+		close(stop)
+		<-done
+	}()
+
+	ctx := Background()
+	for round := 0; round < 5; round++ {
+		arc := filepath.Join(tmp, fmt.Sprintf("snap-%d.tar", round))
+		if err := m.CheckpointStore(ctx, arc); err != nil {
+			t.Fatalf("CheckpointStore: %s", err)
+		}
+		dir := filepath.Join(tmp, fmt.Sprintf("dst-%d", round))
+		if err := RestoreStoreArchive(arc, dir); err != nil {
+			t.Fatalf("RestoreStoreArchive: %s", err)
+		}
+		opt := badger.DefaultOptions(dir)
+		opt.Logger = nil
+		cp, err := badger.Open(opt)
+		if err != nil {
+			t.Fatalf("open copy: %s", err)
+		}
+		err = cp.View(func(txn *badger.Txn) error {
+			get := func(k string) string {
+				item, err := txn.Get([]byte(k))
+				if err != nil {
+					return "<" + err.Error() + ">"
+				}
+				v, _ := item.ValueCopy(nil)
+				return string(v)
+			}
+			for p := 0; p < pairs; p++ {
+				a, z := get(fmt.Sprintf("a/%02d", p)), get(fmt.Sprintf("z/%02d", p))
+				if a != z {
+					return fmt.Errorf("round %d: pair %d torn: a=%s z=%s", round, p, a, z)
+				}
+			}
+			return nil
+		})
+		cp.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 }

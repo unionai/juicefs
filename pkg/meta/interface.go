@@ -55,6 +55,9 @@ const (
 	Clone = 1006
 	// Checkpoint is a message to flush + snapshot the metadata store to a local file.
 	Checkpoint = 1009
+	// CheckpointConfirm tells the client a checkpoint it wrote was published,
+	// making it the base of later delta checkpoints.
+	CheckpointConfirm = 1010
 	// OpSummary is a message to get tree summary of directories.
 	OpSummary = 1007
 	// CompactPath is a message to trigger compact
@@ -567,6 +570,28 @@ type Meta interface {
 	ListTokens(ctx Context) (tokens map[uint32][]byte, st syscall.Errno)
 
 	ScanChangelog(ctx Context, last int64, handler func(ver int64, entry string) error) error
+}
+
+// PinnedCheckpointer is implemented by engines whose CheckpointStore can say
+// when the snapshot's content became fixed. pinned is called once, before the
+// snapshot is written out; anything that happens after it is not in the
+// snapshot. A caller that holds writers back so the snapshot includes (or
+// excludes) them can release them there instead of when the write finishes.
+type PinnedCheckpointer interface {
+	CheckpointStorePinned(ctx Context, dst string, pinned func()) error
+}
+
+// DeltaCheckpointer is implemented by engines that can write a checkpoint
+// holding only what changed since the last one the caller confirmed as
+// published (see pkg/meta/badger_delta.go). Every checkpoint written through
+// it -- full or delta -- is identified by its read timestamp, which the
+// caller passes to ConfirmCheckpoint once the checkpoint is published.
+// CheckpointStoreDeltaPinned returns ErrNoDeltaBase when there is no
+// confirmed base to take a delta against; take a full checkpoint then.
+type DeltaCheckpointer interface {
+	CheckpointStoreFullPinned(ctx Context, dst string, pinned func()) (readTs uint64, err error)
+	CheckpointStoreDeltaPinned(ctx Context, dst string, pinned func()) (base, readTs uint64, err error)
+	ConfirmCheckpoint(ctx Context, readTs uint64) error
 }
 
 type CheckOpt struct {
