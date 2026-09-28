@@ -133,6 +133,15 @@ func (fs *fileSystem) SetAttr(cancel <-chan struct{}, in *fuse.SetAttrIn, out *f
 		// passthrough backing so it doesn't diverge from the metadata.
 		fs.pt.truncate(Ino(in.NodeId), in.Size)
 	}
+	if in.Valid&(fuse.FATTR_MTIME|fuse.FATTR_MTIME_NOW) != 0 {
+		// A live passthrough file's data is copied into JuiceFS after close,
+		// which would stamp over this time; remember it for the reconcile.
+		mtime := time.Unix(int64(in.Mtime), int64(in.Mtimensec))
+		if in.Valid&fuse.FATTR_MTIME_NOW != 0 {
+			mtime = time.Now()
+		}
+		fs.pt.setMtime(Ino(in.NodeId), mtime)
+	}
 	fs.replyAttr(ctx, entry, &out.Attr, out.SetTimeout)
 	return 0
 }

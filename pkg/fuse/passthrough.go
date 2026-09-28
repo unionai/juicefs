@@ -124,6 +124,11 @@ type ptBacking struct {
 	// changes the JuiceFS inode behind the staging's back must clear it (see
 	// truncate). Guarded by mu.
 	synced *ptSyncMark
+	// mtime is an explicit modification time set (utimensat/futimens) while
+	// the backing was live, and mtimeAt when it arrived. See finalMtime.
+	// Guarded by mu.
+	mtime   *time.Time
+	mtimeAt time.Time
 }
 
 type ptFile struct {
@@ -693,6 +698,12 @@ func (p *passthroughState) reconcile(ctx vfs.Context, v *vfs.VFS, fh uint64) {
 
 	pf.b.mu.Lock()
 	defer pf.b.mu.Unlock()
+	// The staging file's own mtime is when this file's data last changed:
+	// passthrough writes land there directly. Read it before the copy.
+	var lastWrite time.Time
+	if st, err := os.Stat(pf.b.path); err == nil {
+		lastWrite = st.ModTime()
+	}
 	var off uint64
 	if pf.stagingUnchangedLocked() {
 		// An fsync already copied exactly this content into slices; a second
@@ -711,6 +722,13 @@ func (p *passthroughState) reconcile(ctx vfs.Context, v *vfs.VFS, fh uint64) {
 	if e := v.Flush(ctx, pf.ino, fh, 0); e != 0 {
 		logger.Errorf("passthrough: reconcile flush ino %d: %s", pf.ino, e)
 		return
+	}
+	// The copy just committed the data stamped with the time of the copy.
+	// Put back the file's real modification time -- see finalMtime.
+	if t, ok := finalMtime(lastWrite, pf.b.mtime, pf.b.mtimeAt); ok {
+		if _, e := v.SetAttr(ctx, pf.ino, meta.SetAttrMtime, fh, 0, 0, 0, 0, t.Unix(), 0, uint32(t.Nanosecond()), 0); e != 0 {
+			logger.Warnf("passthrough: restore mtime of ino %d: %s", pf.ino, e)
+		}
 	}
 	// Passthrough writes bypassed the daemon, so the kernel's cached size and
 	// page data for this inode are stale (size is still 0 from the empty
@@ -833,6 +851,49 @@ func (p *passthroughState) fsync(ctx vfs.Context, v *vfs.VFS, fh uint64) (bool, 
 // set: reads through the passthrough fd see the old data/EOF, and the
 // release-time reconcile (linear copy of the staging, authority on final
 // content) would silently undo the truncate.
+// finalMtime is the modification time a reconciled file must end up with.
+// The reconcile copies the staging content into JuiceFS after close(2),
+// and that write stamps the file with the time of the copy -- later than
+// the file's last change, and after any time the application set itself:
+// cp -a, tar -x and rsync -t all set a file's times (futimens) before
+// closing it. The kernel diverts only read/write/mmap to the backing, so
+// that setattr reaches the daemon (see setMtime) while the data sits in the
+// staging file, whose own mtime says when the data last changed. An
+// explicit time wins if it arrived after that last change; otherwise the
+// last change is the file's mtime. Returns false when neither is known.
+func finalMtime(lastWrite time.Time, explicit *time.Time, explicitAt time.Time) (time.Time, bool) {
+	if explicit != nil && (lastWrite.IsZero() || !explicitAt.Before(lastWrite)) {
+		return *explicit, true
+	}
+	if !lastWrite.IsZero() {
+		return lastWrite, true
+	}
+	return time.Time{}, false
+}
+
+// setMtime records an explicit modification time for ino if it has a live
+// passthrough backing, for the reconcile to restore (see finalMtime).
+func (p *passthroughState) setMtime(ino Ino, mtime time.Time) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	var pf *ptFile
+	for _, f := range p.files {
+		if f.ino == ino && f.writer {
+			pf = f
+			break
+		}
+	}
+	p.mu.Unlock()
+	if pf == nil {
+		return
+	}
+	pf.b.mu.Lock()
+	pf.b.mtime, pf.b.mtimeAt = &mtime, time.Now()
+	pf.b.mu.Unlock()
+}
+
 func (p *passthroughState) truncate(ino Ino, size uint64) {
 	if p == nil {
 		return
