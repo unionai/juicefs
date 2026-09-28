@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -474,5 +475,124 @@ func TestCheckpointVerbReportsThePinBeforeTheDrainEnds(t *testing.T) {
 	}
 	if pinnedWhileDraining == 0 {
 		t.Fatalf("no progress frame reported the pin while blocks were still draining (%d frames)", frames)
+	}
+}
+
+// sendCheckpoint drives the verb as `juicefs checkpoint` does and parses the
+// reply: progress frames, then a status byte, or a CDATA result on success
+// when one was asked for.
+func sendCheckpoint(t *testing.T, v *VFS, dst string, flags int) (st syscall.Errno, result map[string]any) {
+	t.Helper()
+	body := 4 + 4 + len(dst)
+	if flags >= 0 {
+		body++
+	}
+	payload := utils.NewBuffer(uint32(body))
+	payload.Put32(30)
+	payload.Put32(uint32(len(dst)))
+	payload.Put([]byte(dst))
+	if flags >= 0 {
+		payload.Put8(uint8(flags))
+	}
+	out := &bytes.Buffer{}
+	v.handleInternalMsg(meta.NewContext(10, 0, []uint32{0}), meta.Checkpoint, utils.FromBuffer(payload.Bytes()), out)
+	b := out.Bytes()
+	off := 0
+	for off+17 <= len(b) && b[off] == meta.CPROGRESS && len(b)-off != 1 {
+		off += 17
+	}
+	rest := b[off:]
+	switch {
+	case len(rest) == 1:
+		return syscall.Errno(rest[0]), nil
+	case len(rest) >= 5 && rest[0] == meta.CDATA:
+		n := binary.BigEndian.Uint32(rest[1:5])
+		if int(n) != len(rest)-5 {
+			t.Fatalf("CDATA length %d, %d bytes follow", n, len(rest)-5)
+		}
+		if err := json.Unmarshal(rest[5:], &result); err != nil {
+			t.Fatalf("result %q: %s", rest[5:], err)
+		}
+		return 0, result
+	}
+	t.Fatalf("unparseable reply tail %v", rest)
+	return 0, nil
+}
+
+func sendConfirm(v *VFS, ts uint64) syscall.Errno {
+	payload := utils.NewBuffer(8)
+	payload.Put64(ts)
+	out := &bytes.Buffer{}
+	v.handleInternalMsg(meta.NewContext(10, 0, []uint32{0}), meta.CheckpointConfirm, utils.FromBuffer(payload.Bytes()), out)
+	b := out.Bytes()
+	return syscall.Errno(b[len(b)-1])
+}
+
+func TestCheckpointVerbDeltaProtocol(t *testing.T) {
+	g := newGatedStore()
+	v := newWritebackVFS(t, "badger://"+filepath.Join(t.TempDir(), "meta"), g)
+	tmp := t.TempDir()
+	writeFile(t, v, "a", 64<<10)
+
+	// An old-style request (no flags byte) gets a bare status byte.
+	if st, res := sendCheckpoint(t, v, filepath.Join(tmp, "old.tar"), -1); st != 0 || res != nil {
+		t.Fatalf("legacy request: st=%s result=%v", st, res)
+	}
+	// Full, with a result.
+	st, full := sendCheckpoint(t, v, filepath.Join(tmp, "full.tar"), int(checkpointFlagResult))
+	if st != 0 || full["kind"] != "full" || full["read_ts"] == nil {
+		t.Fatalf("full: st=%s result=%v", st, full)
+	}
+	fullTs := uint64(full["read_ts"].(float64))
+	if e := sendConfirm(v, fullTs+1000); e != syscall.ENOENT {
+		t.Fatalf("confirming an unknown checkpoint: %s, want ENOENT", e)
+	}
+	if e := sendConfirm(v, fullTs); e != 0 {
+		t.Fatalf("confirm: %s", e)
+	}
+	writeFile(t, v, "b", 64<<10)
+	st, delta := sendCheckpoint(t, v, filepath.Join(tmp, "d1"), int(checkpointFlagDelta|checkpointFlagResult))
+	if st != 0 || delta["kind"] != "delta" || uint64(delta["base"].(float64)) != fullTs {
+		t.Fatalf("delta: st=%s result=%v (want base %d)", st, delta, fullTs)
+	}
+	if !meta.IsStoreDelta(filepath.Join(tmp, "d1")) {
+		t.Fatalf("the delta checkpoint file is not a delta")
+	}
+	// The delta restores, on top of the full one, to the store as of the delta.
+	dir := filepath.Join(t.TempDir(), "restored")
+	if err := meta.RestoreStoreArchive(filepath.Join(tmp, "full.tar"), dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := meta.ApplyStoreDeltas(dir, []string{filepath.Join(tmp, "d1")}); err != nil {
+		t.Fatal(err)
+	}
+	rm := meta.NewClient("badger://"+dir, meta.DefaultConf())
+	if _, err := rm.Load(true); err != nil {
+		t.Fatalf("load restored: %s", err)
+	}
+	defer rm.Shutdown()
+	var ino meta.Ino
+	var attr meta.Attr
+	for _, name := range []string{"a", "b"} {
+		if st := rm.Lookup(meta.Background(), 1, name, &ino, &attr, false); st != 0 {
+			t.Fatalf("restored store has no %q: %s", name, st)
+		}
+	}
+}
+
+func TestCheckpointVerbDeltaOnAnEngineWithoutDeltas(t *testing.T) {
+	g := newGatedStore()
+	v := newWritebackVFS(t, "sqlite3://"+filepath.Join(t.TempDir(), "meta.db"), g)
+	st, _ := sendCheckpoint(t, v, filepath.Join(t.TempDir(), "d"), int(checkpointFlagDelta|checkpointFlagResult))
+	if st != syscall.ENOTSUP {
+		t.Fatalf("delta on sqlite: %s, want ENOTSUP", st)
+	}
+	if e := sendConfirm(v, 1); e != syscall.ENOTSUP {
+		t.Fatalf("confirm on sqlite: %s, want ENOTSUP", e)
+	}
+	// A full checkpoint with a result still works there, without a read_ts.
+	st, res := sendCheckpoint(t, v, filepath.Join(t.TempDir(), "f.db"), int(checkpointFlagResult))
+	if st != 0 || res["kind"] != "full" {
+		t.Fatalf("full on sqlite: %s %v", st, res)
 	}
 }

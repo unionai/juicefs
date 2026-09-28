@@ -52,7 +52,18 @@ Badger backup streams, and are detected and replayed instead.
 
 Examples:
 $ juicefs checkpoint-restore /var/lib/vol/checkpoint.bak badger:///var/lib/vol/meta
-$ juicefs checkpoint-restore /var/lib/vol/checkpoint.db sqlite3:///var/lib/vol/meta.db`,
+$ juicefs checkpoint-restore /var/lib/vol/checkpoint.db sqlite3:///var/lib/vol/meta.db
+$ juicefs checkpoint-restore base.tar badger:///var/lib/vol/meta --delta d1 --delta d2
+
+--delta applies delta checkpoints ('juicefs checkpoint --delta'), in the order
+given, on top of SRC: the chain a published version is made of. Every delta
+is verified before any is applied.`,
+		Flags: []cli.Flag{
+			&cli.StringSliceFlag{
+				Name:  "delta",
+				Usage: "a delta checkpoint to apply after SRC (repeat, in chain order; BadgerDB only)",
+			},
+		},
 	}
 }
 
@@ -110,7 +121,10 @@ func checkpointRestore(ctx *cli.Context) error {
 			return fmt.Errorf("restore %s into %s: %s", src, uri, err)
 		}
 		logger.Infof("restored %s to %s (store archive)", src, uri)
-		return nil
+		return applyDeltas(ctx.StringSlice("delta"), dir)
+	}
+	if deltas := ctx.StringSlice("delta"); len(deltas) > 0 && !strings.HasPrefix(uri, "badger://") {
+		return fmt.Errorf("--delta applies to badger:// stores only; got %s", uri)
 	}
 
 	m := meta.NewClient(uri, nil)
@@ -121,5 +135,19 @@ func checkpointRestore(ctx *cli.Context) error {
 		return fmt.Errorf("close restored store: %s", err)
 	}
 	logger.Infof("restored %s to %s", src, uri)
+	if dir, ok := strings.CutPrefix(uri, "badger://"); ok {
+		return applyDeltas(ctx.StringSlice("delta"), strings.Split(dir, "?")[0])
+	}
+	return nil
+}
+
+func applyDeltas(deltas []string, dir string) error {
+	if len(deltas) == 0 {
+		return nil
+	}
+	if err := meta.ApplyStoreDeltas(dir, deltas); err != nil {
+		return fmt.Errorf("apply delta checkpoints to %s: %s", dir, err)
+	}
+	logger.Infof("applied %d delta checkpoint(s) to %s", len(deltas), dir)
 	return nil
 }

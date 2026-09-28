@@ -149,6 +149,7 @@ type badgerClient struct {
 	ticker *time.Ticker
 	done   chan struct{}
 	nextid uint64
+	holds  deltaHolds // see badger_delta.go
 }
 
 // checkpointTo writes a store archive (see store_archive.go) of this store
@@ -170,17 +171,29 @@ type badgerClient struct {
 // caller holding writers back only for the snapshot's sake can let them go
 // without waiting for the copy.
 func (c *badgerClient) checkpointTo(dst string, pinned func()) error {
+	_, err := c.checkpointFullTo(dst, pinned)
+	return err
+}
+
+// checkpointFullTo is checkpointTo that also returns the checkpoint's read
+// timestamp, under which it is held as pending (see badger_delta.go).
+func (c *badgerClient) checkpointFullTo(dst string, pinned func()) (uint64, error) {
 	// Next to dst, so the archive is a rename away from its final home and
 	// the caller's choice of filesystem (and free space) governs both.
 	tmp, err := os.MkdirTemp(filepath.Dir(dst), ".badger-checkpoint-")
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer os.RemoveAll(tmp)
-	if err := c.copyTo(tmp, pinned); err != nil {
-		return err
+	ts, err := c.copyTo(tmp, pinned)
+	if err != nil {
+		return 0, err
 	}
-	return tarDirectory(tmp, dst)
+	if err := tarDirectory(tmp, dst); err != nil {
+		c.holds.drop(ts)
+		return 0, err
+	}
+	return ts, nil
 }
 
 // checkpointWorkers is how many key ranges copyTo reads at once.
@@ -202,7 +215,7 @@ const checkpointWorkers = 4
 // the result holds one table level of sorted data: smaller than the source
 // (no overwritten versions, no deleted keys) and with no compaction debt for
 // whoever opens it next.
-func (c *badgerClient) copyTo(dir string, pinned func()) (err error) {
+func (c *badgerClient) copyTo(dir string, pinned func()) (readTs uint64, err error) {
 	opt := badger.DefaultOptions(dir)
 	opt.Logger = utils.GetLogger("badger")
 	opt.MetricsEnabled = false
@@ -217,7 +230,7 @@ func (c *badgerClient) copyTo(dir string, pinned func()) (err error) {
 	opt.NumMemtables = 2
 	out, err := badger.Open(opt)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer func() {
 		cerr := out.Close()
@@ -228,7 +241,7 @@ func (c *badgerClient) copyTo(dir string, pinned func()) (err error) {
 
 	sw := out.NewStreamWriter()
 	if err = sw.Prepare(); err != nil {
-		return err
+		return 0, err
 	}
 	// Cancel unblocks the writer goroutines on an early return. Flush does
 	// the same work on the success path, so only one of the two ever runs.
@@ -240,7 +253,12 @@ func (c *badgerClient) copyTo(dir string, pinned func()) (err error) {
 	}()
 
 	txn := c.client.NewTransaction(false)
-	defer txn.Discard()
+	kept := false
+	defer func() {
+		if !kept {
+			txn.Discard()
+		}
+	}()
 	if pinned != nil {
 		pinned()
 	}
@@ -278,13 +296,17 @@ func (c *badgerClient) copyTo(dir string, pinned func()) (err error) {
 		}
 	}
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if err = sw.Flush(); err != nil {
-		return err
+		return 0, err
 	}
 	flushed = true
-	return nil
+	// A delta can be taken against this checkpoint once the caller confirms
+	// it was published (see badger_delta.go).
+	c.holds.addPending(txn)
+	kept = true
+	return txn.ReadTs(), nil
 }
 
 // copyRange copies the latest visible version of every key in [lo, hi) —
@@ -503,6 +525,7 @@ func (c *badgerClient) reset(prefix []byte) error {
 func (c *badgerClient) close() error {
 	close(c.done)
 	c.ticker.Stop()
+	c.holds.close()
 	return c.client.Close()
 }
 
@@ -518,10 +541,15 @@ func newBadgerClient(addr string) (tkvClient, error) {
 	}
 	ticker := time.NewTicker(time.Hour)
 	done := make(chan struct{})
+	c := &badgerClient{client: client, ticker: ticker, done: done}
+	c.holds.init(client)
 	go func() {
 		for {
 			select {
 			case <-ticker.C:
+				if c.holds.expire(deltaHoldMaxAge) {
+					logger.Warnf("badger: released the delta-checkpoint base held for over %s without a confirm; the next checkpoint must be full", deltaHoldMaxAge)
+				}
 				for client.RunValueLogGC(0.7) == nil {
 				}
 			case <-done:
@@ -529,7 +557,7 @@ func newBadgerClient(addr string) (tkvClient, error) {
 			}
 		}
 	}()
-	return &badgerClient{client, ticker, done, 0}, nil
+	return c, nil
 }
 
 func init() {
