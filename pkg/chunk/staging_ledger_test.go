@@ -148,7 +148,7 @@ func TestDiskCacheFeedsTheStagingLedger(t *testing.T) {
 	defer os.RemoveAll(conf.CacheDir)
 	m := new(cacheManagerMetrics)
 	m.initMetrics()
-	s := newCacheStore(m, conf.CacheDir, 1<<30, conf.CacheItems, 1, &conf, nil)
+	s := newDiskCache(m, conf.CacheDir, 1<<30, conf.CacheItems, 1, &conf, nil)
 
 	if _, err := s.stage("1_0_4", []byte("abcd"), 0); err != nil {
 		t.Fatalf("stage: %s", err)
@@ -186,7 +186,7 @@ func TestStagingScanAtStartupFeedsTheLedger(t *testing.T) {
 	// A block a previous process staged and never uploaded.
 	m := new(cacheManagerMetrics)
 	m.initMetrics()
-	first := newCacheStore(m, conf.CacheDir, 1<<30, conf.CacheItems, 1, &conf, nil)
+	first := newDiskCache(m, conf.CacheDir, 1<<30, conf.CacheItems, 1, &conf, nil)
 	if _, err := first.stage("chunks/0/0/5_0_4", []byte("left"), 0); err != nil {
 		t.Fatalf("stage: %s", err)
 	}
@@ -195,7 +195,7 @@ func TestStagingScanAtStartupFeedsTheLedger(t *testing.T) {
 	found := make(chan string, 1)
 	m2 := new(cacheManagerMetrics)
 	m2.initMetrics()
-	newCacheStore(m2, conf.CacheDir, 1<<30, conf.CacheItems, 1, &conf, func(key, path string, force bool) bool {
+	newDiskCache(m2, conf.CacheDir, 1<<30, conf.CacheItems, 1, &conf, func(key, path string, force bool) bool {
 		found <- key
 		return false // leave it staged
 	})
