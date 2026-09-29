@@ -986,17 +986,14 @@ func (fs *FileSystem) doResolve(ctx meta.Context, p string, followLastSymlink bo
 		}
 
 		var inode Ino
-		var resolved bool
+		isLastComponent := i == len(ss)-1
 
 		err = fs.lookup(ctx, parent, name, &inode, attr)
-		if i == len(ss)-1 {
-			resolved = true
-		}
 		if err != 0 {
 			return
 		}
 		fi = AttrToFileInfo(inode, attr)
-		if (!resolved || followLastSymlink) && fi.IsSymlink() {
+		if (!isLastComponent || followLastSymlink) && fi.IsSymlink() {
 			if _, ok := visited[inode]; ok {
 				logger.Errorf("find a loop symlink: %d", inode)
 				return nil, syscall.ELOOP
@@ -1021,18 +1018,24 @@ func (fs *FileSystem) doResolve(ctx meta.Context, p string, followLastSymlink bo
 					target = target[len(mp):]
 				} else {
 					fi.name = "file:" + target
-					logger.Errorf("external link: %s -> %s", p, target)
+					linkPath := strings.Join(ss[:i+1], "/")
+					if linkPath == "" {
+						linkPath = "/"
+					}
+					logger.Warnf("external link: %s -> %s (while resolving %s)", linkPath, target, p)
 					return fi, utils.ErrExtlink
 				}
 			} else {
 				target = path.Join(strings.Join(ss[:i], "/"), target)
 			}
-			fi, err = fs.doResolve(ctx, target, followLastSymlink, visited)
-			if err != 0 {
-				return
+			if !isLastComponent {
+				target += "/" + strings.Join(ss[i+1:], "/")
 			}
-			inode = fi.Inode()
-			attr = fi.attr
+			fi, err = fs.doResolve(ctx, target, followLastSymlink, visited)
+			if err == 0 && isLastComponent {
+				fi.name = name
+			}
+			return
 		}
 		fi.name = name
 		parent = inode
@@ -1579,7 +1582,7 @@ func (f *File) GetTreeSummary(ctx meta.Context, depth, entries uint8, strict boo
 	defer func() {
 		f.fs.log(l, "GetTreeSummary (%s,%d,%d,%t): %s (%d,%d,%d)", f.path, depth, entries, strict, errstr(err), s.Size, s.Files, s.Dirs)
 	}()
-	err = f.fs.m.GetTreeSummary(ctx, s, depth, entries, strict, nil)
+	err = f.fs.m.GetTreeSummary(ctx, s, depth, entries, strict, meta.SortBySize, nil)
 	s.Path = path.Base(f.path)
 	return
 }

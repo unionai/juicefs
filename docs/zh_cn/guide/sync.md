@@ -204,6 +204,14 @@ juicefs sync /media/ "username:password"@192.168.1.100:/backup/
 
 当使用 SFTP/SSH 协议时，如果没有指定密码，执行 sync 任务时会提示输入密码。如果希望显式指定用户名和密码，则需要用半角引号把用户名和密码括起来，用户名和密码之间用半角冒号分隔。
 
+SFTP 远端路径支持以下格式：
+
+- 使用默认 SSH 端口：`username@host:/path`
+- 指定 SSH 端口：`username@host:port:/path`
+- IPv6 地址并指定 SSH 端口：`username@[2001:db8::1]:2022:/path`
+
+指定 SSH 端口时，端口和路径之间的冒号不能省略。例如，应使用 `username@192.168.1.100:2022:/backup/`，不能写成 `username@192.168.1.100:2022/backup/`。远端路径开始后的冒号会被视为路径的一部分，因此 `/backup/2026-07-23T05:53:21/` 这样的时间戳路径无需进行 URL 编码。
+
 ## 同步行为
 
 ### 增量同步与全量同步 {#incremental-and-full-synchronization}
@@ -353,7 +361,7 @@ sync 客户端与流量控制服务之间使用简单的 JSON over HTTP 协议�
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `granted` | int64 | 实际授予的字节数（阻塞式服务端等于请求量） |
-| `expired` | int64 | 令牌有效期，单位**毫秒**，客户端会在到期前归还未用令牌 |
+| `expired` | int64 | 令牌有效期，单位**毫秒**；有效期过后，客户端在当前没有新的带宽需求时会归还未用完的令牌 |
 
 客户端会阻塞在 POST 请求直到服务端响应，因此服务端内部的令牌桶（或其他限速逻辑）即为全局限速的执行者。
 
@@ -418,7 +426,9 @@ go run traffic_control_server.go
 juicefs sync --traffic-control-url http://10.0.0.1:8080/token s3://src/ s3://dst/
 ```
 
-`--bwlimit` 与 `--traffic-control-url` 可以同时使用：`--bwlimit` 为单个进程设置上限，`--traffic-control-url` 则在所有进程之间执行全局上限。
+`--bwlimit` 与 `--traffic-control-url` 可以同时使用。每次限速检查都会优先尝试全局流量控制服务；如果服务不可用，本次检查回退到本地 `--bwlimit`。服务恢复后，后续检查重新使用全局限流；已经进入本地 `--bwlimit` 等待的请求不会因恢复而被中断切换。为了让回退真正起到限速作用，应将 `--bwlimit`（单进程上限）设置得比全局上限更小一些。
+
+如果只设置了 `--traffic-control-url` 而没有设置 `--bwlimit`，则没有本地兜底：在流量控制服务不可用期间，sync 会以**不限速**的方式传输（对应日志 `run without rate limit`），待服务恢复后再切回全局限流。
 
 ## 观测和监控 {#observation}
 

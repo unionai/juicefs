@@ -17,10 +17,12 @@
 package object
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"math/rand"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -36,6 +38,10 @@ var ctx = context.Background()
 var logger = utils.GetLogger("juicefs")
 
 var UserAgent = "JuiceFS"
+
+func setUserAgent(req *http.Request) {
+	req.Header.Set("User-Agent", UserAgent)
+}
 
 type MtimeChanger interface {
 	Chtimes(path string, mtime time.Time) error
@@ -75,6 +81,15 @@ func (f *file) Owner() string     { return f.owner }
 func (f *file) Group() string     { return f.group }
 func (f *file) Mode() os.FileMode { return f.mode }
 func (f *file) IsSymlink() bool   { return f.isSymlink }
+
+func NewSymlink(key, target string) File {
+	return &file{
+		obj{key, int64(len(target)), time.Now(), false, "", ""},
+		"", "",
+		os.ModeSymlink | 0777,
+		true,
+	}
+}
 
 func MarshalObject(o Object) map[string]interface{} {
 	m := make(map[string]interface{})
@@ -351,11 +366,20 @@ type SupportTier interface {
 	GetTier(ctx context.Context) Tier
 }
 
+type runtimeTier struct {
+	Tier
+	encodedTag string
+}
+
 type tierStorage struct {
-	tiers map[uint8]Tier
+	tiers map[uint8]runtimeTier
 }
 
 func (b *tierStorage) GetTier(ctx context.Context) Tier {
+	return b.getRuntimeTier(ctx).Tier
+}
+
+func (b *tierStorage) getRuntimeTier(ctx context.Context) runtimeTier {
 	if id, ok := ctx.Value(TierKey{}).(uint8); ok {
 		if t, ok := b.tiers[id]; ok {
 			return t
@@ -369,16 +393,17 @@ func (b *tierStorage) InitTiers(init Tiers) error {
 	if init == nil {
 		init = NewTiers("")
 	}
+	tiers := make(map[uint8]runtimeTier, len(init))
 	for id, t := range init {
+		tier := runtimeTier{Tier: t}
 		if t.Tag != "" && !ValidateTag(t.Tag) {
 			logger.Warnf("invalid tag %q for tier %d; ignore it", t.Tag, id)
-			t.encodedTag = ""
 		} else {
-			t.encodedTag = encodeTag(t.Tag)
+			tier.encodedTag = encodeTag(t.Tag)
 		}
-		init[id] = t
+		tiers[id] = tier
 	}
-	b.tiers = init
+	b.tiers = tiers
 	return nil
 }
 
@@ -394,10 +419,9 @@ func encodeTag(tag string) string {
 }
 
 type Tier struct {
-	ID         uint8  `json:"ID"`
-	Sc         string `json:"StorageClass"`
-	Tag        string `json:"Tag"`
-	encodedTag string
+	ID  uint8  `json:"ID"`
+	Sc  string `json:"StorageClass"`
+	Tag string `json:"Tag"`
 }
 
 func ValidateTag(tag string) bool {
@@ -427,4 +451,51 @@ func getOrDefaultScValue(v, defaultValue string) string {
 		return defaultValue
 	}
 	return v
+}
+
+const s3RequestIDKey = "X-Amz-Request-Id"
+
+func isExists(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "BucketAlreadyExists") || strings.Contains(msg, "BucketAlreadyOwnedByYou")
+}
+
+func defaultPathStyle() bool {
+	v := os.Getenv("JFS_S3_VHOST_STYLE")
+	return v == "" || v == "0" || v == "false"
+}
+
+func findLen(in io.Reader) (io.Reader, int64, error) {
+	var vlen int64
+	switch v := in.(type) {
+	case *bytes.Buffer:
+		vlen = int64(v.Len())
+	case *bytes.Reader:
+		vlen = int64(v.Len())
+	case *strings.Reader:
+		vlen = int64(v.Len())
+	case *os.File:
+		st, err := v.Stat()
+		if err != nil {
+			return nil, 0, err
+		}
+		vlen = st.Size()
+	case io.ReadSeeker:
+		var err error
+		vlen, err = v.Seek(0, 2)
+		if err != nil {
+			return nil, 0, err
+		}
+		if _, err = v.Seek(0, 0); err != nil {
+			return nil, 0, err
+		}
+	default:
+		d, err := io.ReadAll(in)
+		if err != nil {
+			return nil, 0, err
+		}
+		vlen = int64(len(d))
+		in = bytes.NewBuffer(d)
+	}
+	return in, vlen, nil
 }

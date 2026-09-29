@@ -20,7 +20,11 @@ import (
 	"context"
 	"io"
 	"io/fs"
+	"net/http"
+	"net/http/httptest"
+	_ "net/http/pprof"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/juicedata/juicefs/pkg/meta"
@@ -78,10 +82,40 @@ func TestWebdav(t *testing.T) {
 	if webdavFS.RemoveAll(ctx, "/d2") != nil {
 		t.Fatalf("webdavFS removeAll failed: %s", err)
 	}
-	if _, err = webdavFS.Stat(ctx, "/d2"); err != os.ErrNotExist {
+	missingInfo, err := webdavFS.Stat(ctx, "/d2")
+	if err != os.ErrNotExist {
 		t.Fatalf("webdavFS removeAll failed: %s", err)
+	}
+	if missingInfo != nil {
+		t.Fatalf("webdavFS stat returned non-nil info for missing path: %#v", missingInfo)
 	}
 	if err = aFile.Close(); err != nil {
 		t.Fatalf("webdavFS close file failed: %s", err)
+	}
+}
+
+func TestWebdavNoPprofExposure(t *testing.T) {
+	jfs := createTestFS(t)
+	config := WebdavConfig{Username: "user", Password: "pass"}
+	handler := newWebdavHandler(jfs, config)
+	ts := httptest.NewServer(handler)
+	defer ts.Close()
+
+	for _, path := range []string{"/", "/debug/pprof/", "/debug/pprof/cmdline", "/metrics"} {
+		resp, err := http.Get(ts.URL + path)
+		if err != nil {
+			t.Fatalf("GET %s: %s", path, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		// Without credentials every path must be rejected by Basic Auth,
+		// proving pprof/metrics are not served on a separate unauthenticated route.
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("GET %s: expected 401, got %d", path, resp.StatusCode)
+		}
+		// The process command line (leaked by /debug/pprof/cmdline) must never appear.
+		if strings.Contains(string(body), os.Args[0]) {
+			t.Fatalf("GET %s: response leaked process command line", path)
+		}
 	}
 }

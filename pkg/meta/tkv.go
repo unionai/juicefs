@@ -83,7 +83,8 @@ type tkvClient interface {
 
 type kvTxn struct {
 	kvtxn
-	retry int
+	retry    int
+	onCommit func(func())
 }
 
 func (tx *kvTxn) deleteKeys(prefix []byte) {
@@ -128,6 +129,7 @@ func newKVMeta(driver, addr string, conf *Config) (Meta, error) {
 }
 
 func (m *kvMeta) Shutdown() error {
+	m.of.close()
 	return m.client.close()
 }
 
@@ -212,7 +214,7 @@ func (m *kvMeta) Name() string {
 }
 
 func (m *kvMeta) doDeleteSlice(id uint64, size uint32) error {
-	if !m.fmt.ChangeLog {
+	if !m.getFormat().ChangeLog {
 		return m.deleteKeys(m.sliceKey(id, size))
 	}
 	return m.txn(Background(), func(tx *kvTxn) error {
@@ -638,7 +640,7 @@ func (m *kvMeta) doInit(format *Format, force bool) error {
 		return fmt.Errorf("json: %s", err)
 	}
 
-	m.fmt = format
+	m.setFormat(format)
 	ts := time.Now().Unix()
 	attr := &Attr{
 		Typ:    TypeDirectory,
@@ -718,7 +720,7 @@ func (m *kvMeta) doFlushStats() {
 }
 
 func (m *kvMeta) doNewSession(sinfo []byte, update bool) error {
-	if !m.fmt.ChangeLog {
+	if !m.getFormat().ChangeLog {
 		if err := m.setValue(m.sessionKey(m.sid), m.packInt64(m.expireTime())); err != nil {
 			return fmt.Errorf("new session: %s", err)
 		}
@@ -744,7 +746,7 @@ func (m *kvMeta) doRefreshSession() error {
 		buf := tx.get(m.sessionKey(m.sid))
 		if buf == nil {
 			logger.Warnf("Session %d was stale and cleaned up, but now it comes back again", m.sid)
-			tx.set(m.sessionInfoKey(m.sid), m.newSessionInfo())
+			tx.set(m.sessionInfoKey(m.sid), m.currentSessionInfo())
 		}
 		expire := m.expireTime()
 		tx.set(m.sessionKey(m.sid), m.packInt64(expire))
@@ -826,7 +828,7 @@ func (m *kvMeta) doCleanStaleSession(sid uint64) error {
 	if fail {
 		return fmt.Errorf("failed to clean up sid %d", sid)
 	} else {
-		if !m.fmt.ChangeLog {
+		if !m.getFormat().ChangeLog {
 			return m.deleteKeys(m.sessionKey(sid), m.legacySessionKey(sid), m.sessionInfoKey(sid))
 		}
 		return m.txn(ctx, func(tx *kvTxn) error {
@@ -984,7 +986,7 @@ func (m *kvMeta) ListSessions() ([]*Session, error) {
 }
 
 func (m *kvMeta) genLog(tx *kvTxn, ts time.Time, op string, args ...any) {
-	if !m.fmt.ChangeLog {
+	if !m.getFormat().ChangeLog {
 		return
 	}
 	id := tx.id()
@@ -1191,7 +1193,20 @@ func (m *kvMeta) txn(ctx Context, f func(tx *kvTxn) error, inodes ...Ino) error 
 			logger.Warnf("Transaction %s interrupted after %s, tried %d, inodes: %v", method.name(ctx), time.Since(start), i+1, inodes)
 			return syscall.EINTR
 		}
-		err := m.client.txn(ctx, f, i)
+		var callbacks []func()
+		err := m.client.txn(ctx, func(tx *kvTxn) error {
+			// Drivers may retry the callback internally, so keep only the last attempt.
+			callbacks = nil
+			tx.onCommit = func(callback func()) {
+				callbacks = append(callbacks, callback)
+			}
+			return f(tx)
+		}, i)
+		if err == nil {
+			for _, callback := range callbacks {
+				callback()
+			}
+		}
 		if eno, ok := err.(syscall.Errno); ok && eno == 0 {
 			err = nil
 		}
@@ -1339,7 +1354,7 @@ func (m *kvMeta) doSetAttr(ctx Context, inode Ino, set uint16, sugidclearmode ui
 		dirtyAttr.Ctimensec = uint32(now.Nanosecond())
 		tx.set(m.inodeKey(inode), m.marshal(dirtyAttr))
 		*attr = *dirtyAttr
-		m.genLog(tx, now, "SETATTR(%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d)", inode, set, sugidclearmode, attr.Uid, attr.Gid, attr.Mode, attr.Flags, attr.Atime, attr.Mtime, attr.Atimensec, attr.Mtimensec, attr.Ctime, attr.Ctimensec, attr.AccessACL)
+		m.genLog(tx, now, "SETATTR(%d,%d,%d,%s)", inode, set, sugidclearmode, attr.logFields())
 		return nil
 	}, inode))
 }
@@ -1632,7 +1647,7 @@ func (m *kvMeta) doMknod(ctx Context, parent Ino, name string, _type uint8, mode
 		if behavior == nil {
 			behavior = runtime.GOOS
 		}
-		m.genLog(tx, now, "CREATE(%d,%s,%d,%d,%d,%d,%d,%s,%s,%t):%d", parent, logEncode2(name), ctx.Uid(), ctx.Gid(), _type, mode, cumask, logEncode2(path), behavior, updateParent, *inode)
+		m.genLog(tx, now, "CREATE(%d,%s,%d,%d,%d,%d,%d,%s,%s,%t,%d,%d):%d", parent, logEncode2(name), ctx.Uid(), ctx.Gid(), _type, mode, cumask, logEncode2(path), behavior, updateParent, attr.Rdev, attr.Mode, *inode)
 		return nil
 	}, parent))
 }
@@ -1652,7 +1667,9 @@ func (m *kvMeta) doUnlink(ctx Context, parent Ino, name string, attr *Attr, skip
 	var inode Ino
 	var opened bool
 	var newSpace, newInode int64
+	requestedTrash := trash
 	err := m.txn(ctx, func(tx *kvTxn) error {
+		trash = requestedTrash
 		opened = false
 		*attr = Attr{}
 		newSpace, newInode = 0, 0
@@ -1817,6 +1834,7 @@ func (m *kvMeta) doBatchUnlink(ctx Context, parent Ino, entries []*Entry, delta 
 		opened bool
 		length uint64
 	}
+	skipFlags := ignoreAttrFlags(ctx)
 	for len(entries) > 0 {
 		batchSize := batchNum
 		if batchSize > len(entries) {
@@ -1856,7 +1874,7 @@ func (m *kvMeta) doBatchUnlink(ctx Context, parent Ino, entries []*Entry, delta 
 			if st := m.Access(ctx, parent, MODE_MASK_W|MODE_MASK_X, &pattr); st != 0 {
 				return st
 			}
-			if (pattr.Flags&FlagAppend) != 0 || (pattr.Flags&FlagImmutable) != 0 {
+			if !skipFlags && ((pattr.Flags&FlagAppend) != 0 || (pattr.Flags&FlagImmutable) != 0) {
 				return syscall.EPERM
 			}
 
@@ -1867,6 +1885,7 @@ func (m *kvMeta) doBatchUnlink(ctx Context, parent Ino, entries []*Entry, delta 
 				keys = append(keys, m.entryKey(parent, string(entry.Name)))
 			}
 			vals := tx.gets(keys...)
+			seenNames := make(map[string]struct{}, len(batch))
 			for idx, entry := range batch {
 				if vals[idx] == nil {
 					continue
@@ -1875,8 +1894,13 @@ func (m *kvMeta) doBatchUnlink(ctx Context, parent Ino, entries []*Entry, delta 
 				if ino != entry.Inode || typ == TypeDirectory || (entry.Attr != nil && typ != entry.Attr.Typ) {
 					continue
 				}
+				name := string(entry.Name)
+				if _, ok := seenNames[name]; ok {
+					continue
+				}
+				seenNames[name] = struct{}{}
 				info := entryInfo{
-					name:  string(entry.Name),
+					name:  name,
 					inode: ino,
 					typ:   typ,
 					trash: trash,
@@ -1923,7 +1947,7 @@ func (m *kvMeta) doBatchUnlink(ctx Context, parent Ino, entries []*Entry, delta 
 					if ctx.Uid() != 0 && pattr.Mode&01000 != 0 && ctx.Uid() != pattr.Uid && ctx.Uid() != attr.Uid {
 						return syscall.EACCES
 					}
-					if (attr.Flags&FlagAppend) != 0 || (attr.Flags&FlagImmutable) != 0 {
+					if !skipFlags && ((attr.Flags&FlagAppend) != 0 || (attr.Flags&FlagImmutable) != 0) {
 						return syscall.EPERM
 					}
 					if (attr.Flags & FlagSkipTrash) != 0 {
@@ -2064,12 +2088,13 @@ func (m *kvMeta) doBatchUnlink(ctx Context, parent Ino, entries []*Entry, delta 
 			}
 			if len(entryInfos) > 0 {
 				names := make([]string, 0, len(entryInfos))
-				inodes := make([]string, 0, len(entryInfos))
+				results := make([]string, 0, 2*len(entryInfos))
 				for _, info := range entryInfos {
 					names = append(names, logEncode2(info.name))
-					inodes = append(inodes, strconv.FormatUint(uint64(info.inode), 10))
+					dnode := delNodes[info.inode]
+					results = append(results, strconv.FormatUint(uint64(info.inode), 10), strconv.FormatBool(dnode != nil && dnode.opened))
 				}
-				m.genLog(tx, now, "UNLINKBATCH(%d,%s,%d,%t):%s", parent, strings.Join(names, ","), trash, updateParent, strings.Join(inodes, ","))
+				m.genLog(tx, now, "UNLINKBATCH(%d,%s,%d,%t):%s", parent, strings.Join(names, ","), trash, updateParent, strings.Join(results, ","))
 			}
 
 			return nil
@@ -2101,12 +2126,18 @@ func (m *kvMeta) doBatchUnlink(ctx Context, parent Ino, entries []*Entry, delta 
 func (m *kvMeta) doRmdir(ctx Context, parent Ino, name string, pinode *Ino, oldAttr *Attr, skipCheckTrash ...bool) syscall.Errno {
 	var trash Ino
 	var attr Attr
+	parentLocks := []Ino{parent}
+	if parent.IsTrash() {
+		parentLocks = nil // trash parent attributes are not updated, so sibling removals are independent.
+	}
 	if !(len(skipCheckTrash) == 1 && skipCheckTrash[0]) {
 		if st := m.checkTrash(parent, &trash); st != 0 {
 			return st
 		}
 	}
+	requestedTrash := trash
 	err := m.txn(ctx, func(tx *kvTxn) error {
+		trash = requestedTrash
 		buf := tx.get(m.entryKey(parent, name))
 		if buf == nil && m.conf.CaseInsensi {
 			if e := m.resolveCase(ctx, parent, name); e != nil {
@@ -2136,7 +2167,7 @@ func (m *kvMeta) doRmdir(ctx Context, parent Ino, name string, pinode *Ino, oldA
 		if st := m.Access(ctx, parent, MODE_MASK_W|MODE_MASK_X, &pattr); st != 0 {
 			return st
 		}
-		if (pattr.Flags&FlagAppend) != 0 || (pattr.Flags&FlagImmutable) != 0 {
+		if !ignoreAttrFlags(ctx) && ((pattr.Flags&FlagAppend) != 0 || (pattr.Flags&FlagImmutable) != 0) {
 			return syscall.EPERM
 		}
 		if tx.exist(m.entryKey(inode, "")) {
@@ -2196,7 +2227,7 @@ func (m *kvMeta) doRmdir(ctx Context, parent Ino, name string, pinode *Ino, oldA
 		}
 		m.genLog(tx, now, "RMDIR(%d,%s,%d):%d", parent, logEncode2(name), trash, inode)
 		return nil
-	}, parent)
+	}, parentLocks...)
 	if err == nil {
 		if trash == 0 {
 			m.updateStats(-align4K(0), -1)
@@ -2223,7 +2254,9 @@ func (m *kvMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentDst 
 	if !parentSrc.IsTrash() { // there should be no conflict if parentSrc is in trash, relax lock to accelerate `restore` subcommand
 		parentLocks = append(parentLocks, parentSrc)
 	}
+	requestedTrash := trash
 	err := m.txn(ctx, func(tx *kvTxn) error {
+		trash = requestedTrash
 		opened = false
 		dino, dtyp = 0, 0
 		tattr = Attr{}
@@ -2308,6 +2341,9 @@ func (m *kvMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentDst 
 			if (tattr.Flags & FlagSkipTrash) != 0 {
 				trash = 0
 			}
+			if !exchange && trash > 0 && tattr.Nlink > 1 && tx.get(m.entryKey(trash, m.trashEntry(parentDst, dino, nameDst))) != nil {
+				trash = 0
+			}
 			tattr.Ctime = now.Unix()
 			tattr.Ctimensec = uint32(now.Nanosecond())
 			if exchange {
@@ -2327,6 +2363,8 @@ func (m *kvMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentDst 
 				}
 			} else if dino == ino {
 				return nil
+			} else if ctx.Uid() != 0 && sattr.Mode&01000 != 0 && ctx.Uid() != sattr.Uid && ctx.Uid() != iattr.Uid {
+				return syscall.EACCES
 			} else if typ == TypeDirectory && dtyp != TypeDirectory {
 				return syscall.ENOTDIR
 			} else if typ != TypeDirectory && dtyp == TypeDirectory {
@@ -2475,7 +2513,7 @@ func (m *kvMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentDst 
 		if dupdate {
 			tx.set(m.inodeKey(parentDst), m.marshal(&dattr))
 		}
-		m.genLog(tx, now, "MOVE(%d,%s,%d,%s,%d,%d,%d):%d", parentSrc, logEncode2(nameSrc), parentDst, logEncode2(nameDst), flags, dino, trash, ino)
+		m.genLog(tx, now, "MOVE(%d,%s,%d,%s,%d,%d,%d,%t):%d", parentSrc, logEncode2(nameSrc), parentDst, logEncode2(nameDst), flags, dino, trash, opened, ino)
 		return nil
 	}, parentLocks...)
 
@@ -3262,13 +3300,11 @@ func (m *kvMeta) scanAllChunks(ctx Context, ch chan<- cchunk, bar *utils.Bar) er
 	})
 }
 
-func (m *kvMeta) ListSlices(ctx Context, slices map[Ino][]Slice, scanPending, delete bool, showProgress func()) syscall.Errno {
-	if delete {
-		_ = m.doCleanupSlices(ctx, nil)
-	}
+func (m *kvMeta) ScanSlices(ctx Context, opt *ScanSlicesOption, fn func(Ino, Slice) error) syscall.Errno {
 	// AiiiiiiiiCnnnn     file chunks
 	klen := 1 + 8 + 1 + 4
-	if err := m.client.scan(m.fmtKey("A"), func(key, value []byte) bool {
+	var cbErr error
+	err := m.client.scan(m.fmtKey("A"), func(key, value []byte) bool {
 		if len(key) != klen || key[1+8] != 'C' {
 			return true
 		}
@@ -3280,38 +3316,54 @@ func (m *kvMeta) ListSlices(ctx Context, slices map[Ino][]Slice, scanPending, de
 		}
 		for _, s := range ss {
 			if s.id > 0 {
-				slices[inode] = append(slices[inode], Slice{Id: s.id, Size: s.size})
-				if showProgress != nil {
-					showProgress()
+				if cbErr = fn(inode, Slice{Id: s.id, Size: s.size}); cbErr != nil {
+					return false
+				}
+				if opt.Progress != nil {
+					opt.Progress()
 				}
 			}
 		}
 		return true
-	}); err != nil {
+	})
+	if cbErr != nil {
+		return errno(cbErr)
+	}
+	if err != nil {
 		return errno(err)
 	}
 
-	if scanPending {
+	if opt.ScanPending {
 		// slice refs: Kccccccccnnnn
 		klen = 1 + 8 + 4
-		_ = m.client.scan(m.fmtKey("K"), func(k, v []byte) bool {
+		cbErr = nil
+		err = m.client.scan(m.fmtKey("K"), func(k, v []byte) bool {
 			if len(k) == klen && len(v) == 8 && parseCounter(v) < 0 {
 				rb := utils.FromBuffer([]byte(k)[1:])
-				slices[0] = append(slices[0], Slice{Id: rb.Get64(), Size: rb.Get32()})
+				if cbErr = fn(0, Slice{Id: rb.Get64(), Size: rb.Get32()}); cbErr != nil {
+					return false
+				}
 			}
 			return true
-
 		})
+		if cbErr != nil {
+			return errno(cbErr)
+		}
+		if err != nil {
+			return errno(err)
+		}
 	}
 
 	if m.getFormat().TrashDays == 0 {
 		return 0
 	}
 	return errno(m.scanTrashSlices(ctx, func(ss []Slice, _ int64) (bool, error) {
-		slices[1] = append(slices[1], ss...)
-		if showProgress != nil {
-			for range ss {
-				showProgress()
+		for _, s := range ss {
+			if err := fn(1, s); err != nil {
+				return false, err
+			}
+			if opt.Progress != nil {
+				opt.Progress()
 			}
 		}
 		return false, nil
@@ -3427,19 +3479,21 @@ func (m *kvMeta) scanPendingFiles(ctx Context, scan pendingFileScan) error {
 	return scanErr
 }
 
-func (m *kvMeta) doRepair(ctx Context, inode Ino, attr *Attr) syscall.Errno {
+func (m *kvMeta) doRepair(ctx Context, inode Ino, attr *Attr, trustNlink bool) syscall.Errno {
 	prefix := m.entryKey(inode, "")
 	return errno(m.txn(ctx, func(tx *kvTxn) error {
-		attr.Nlink = 2
-		tx.scan(prefix, nextKey(prefix), false, func(k, v []byte) bool {
-			typ, _ := m.parseEntry(v)
-			if typ == TypeDirectory {
-				attr.Nlink++
-			}
-			return true
-		})
+		if !trustNlink {
+			attr.Nlink = 2
+			tx.scan(prefix, nextKey(prefix), false, func(k, v []byte) bool {
+				typ, _ := m.parseEntry(v)
+				if typ == TypeDirectory {
+					attr.Nlink++
+				}
+				return true
+			})
+		}
 		tx.set(m.inodeKey(inode), m.marshal(attr))
-		m.genLog(tx, time.Now(), "REPAIRDIR(%d)", inode)
+		m.genLog(tx, time.Now(), "REPAIRDIR(%d,%s)", inode, attr.logFields())
 		return nil
 	}, inode))
 }
@@ -3491,6 +3545,9 @@ func (m *kvMeta) doSetXattr(ctx Context, inode Ino, name string, value []byte, f
 	}
 	key := m.xattrKey(inode, name)
 	return errno(m.txn(ctx, func(tx *kvTxn) error {
+		if tx.get(m.inodeKey(inode)) == nil {
+			return syscall.ENOENT
+		}
 		v := tx.get(key)
 		switch flags {
 		case XattrCreate:
@@ -3507,12 +3564,15 @@ func (m *kvMeta) doSetXattr(ctx Context, inode Ino, name string, value []byte, f
 		}
 		m.genLog(tx, time.Now(), "SETXATTR(%d,%s,%s,%d)", inode, logEncode2(name), logEncode(value), flags)
 		return nil
-	}))
+	}, inode))
 }
 
 func (m *kvMeta) doRemoveXattr(ctx Context, inode Ino, name string) syscall.Errno {
 	key := m.xattrKey(inode, name)
 	return errno(m.txn(ctx, func(tx *kvTxn) error {
+		if tx.get(m.inodeKey(inode)) == nil {
+			return syscall.ENOENT
+		}
 		value := tx.get(key)
 		if value == nil {
 			return ENOATTR
@@ -3520,7 +3580,7 @@ func (m *kvMeta) doRemoveXattr(ctx Context, inode Ino, name string) syscall.Errn
 		tx.delete(key)
 		m.genLog(tx, time.Now(), "REMOVEXATTR(%d,%s)", inode, logEncode2(name))
 		return nil
-	}))
+	}, inode))
 }
 
 func (m *kvMeta) getQuotaKey(qtype uint32, key uint64) ([]byte, error) {
@@ -3595,7 +3655,7 @@ func (m *kvMeta) doSetQuota(ctx Context, qtype uint32, key uint64, quota *Quota)
 			origin.UsedInodes = quota.UsedInodes
 		}
 		tx.set(quotaKey, m.packQuota(origin))
-		m.genLog(tx, time.Now(), "SETQUOTA(%d,%d,%d,%d)", qtype, key, quota.MaxSpace, quota.MaxInodes)
+		m.genLog(tx, time.Now(), "SETQUOTA(%d,%d,%d,%d,%d,%d)", qtype, key, quota.MaxSpace, quota.MaxInodes, quota.UsedSpace, quota.UsedInodes)
 		return nil
 	})
 	return created, err
@@ -3607,26 +3667,22 @@ func (m *kvMeta) doDelQuota(ctx Context, qtype uint32, key uint64) error {
 		return err
 	}
 
-	if qtype == UserQuotaType || qtype == GroupQuotaType {
-		quota := &Quota{}
-		val, err := m.get(quotaKey)
-		if err != nil {
-			return err
-		}
-		if len(val) > 0 {
-			quota = m.parseQuota(val)
-		}
-		quota.MaxSpace = -1
-		quota.MaxInodes = -1
-		return m.txn(ctx, func(tx *kvTxn) error {
+	return m.txn(ctx, func(tx *kvTxn) error {
+		if qtype == UserQuotaType || qtype == GroupQuotaType {
+			quota := &Quota{}
+			if val := tx.get(quotaKey); len(val) > 0 {
+				quota = m.parseQuota(val)
+			}
+			quota.MaxSpace = -1
+			quota.MaxInodes = -1
 			tx.set(quotaKey, m.packQuota(quota))
-			m.genLog(tx, time.Now(), "DELQUOTA(%d,%d)", qtype, key)
-			return nil
-		})
-	} else {
-		// For dir quotas, remove all data
-		return m.deleteKeys(quotaKey)
-	}
+		} else {
+			// For dir quotas, remove all data
+			tx.delete(quotaKey)
+		}
+		m.genLog(tx, time.Now(), "DELQUOTA(%d,%d)", qtype, key)
+		return nil
+	})
 }
 
 func (m *kvMeta) doLoadQuotas(ctx Context) (map[uint64]*Quota, map[uint64]*Quota, map[uint64]*Quota, error) {
@@ -3675,20 +3731,18 @@ func (m *kvMeta) cleanUgUsage(ctx Context, qtype uint32) error {
 		prefix = "QG"
 	}
 
-	pairs, err := m.scanValues(ctx, m.fmtKey(prefix), -1, nil)
-	if err != nil {
-		return fmt.Errorf("failed to scan %s quotas: %w", prefix, err)
-	}
+	begin := m.fmtKey(prefix)
 	return m.txn(ctx, func(tx *kvTxn) error {
-		for k, v := range pairs {
-			if len(v) != 32 {
-				continue
+		tx.scan(begin, nextKey(begin), false, func(key, value []byte) bool {
+			if len(value) != 32 {
+				return true
 			}
-			quota := m.parseQuota(v)
+			quota := m.parseQuota(value)
 			quota.UsedSpace = 0
 			quota.UsedInodes = 0
-			tx.set([]byte(k), m.packQuota(quota))
-		}
+			tx.set(key, m.packQuota(quota))
+			return true
+		})
 		return nil
 	})
 }
@@ -4025,6 +4079,7 @@ func (m *kvMeta) DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fast, 
 	}
 
 	progress := utils.NewProgress(false)
+	defer progress.Done()
 	var tree, trash *DumpedEntry
 	root = m.checkRoot(root)
 
@@ -4313,7 +4368,6 @@ func (m *kvMeta) DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fast, 
 	if _, err = bw.WriteString("\n}\n"); err != nil {
 		return err
 	}
-	progress.Done()
 
 	return bw.Flush()
 }
@@ -4429,9 +4483,7 @@ func (m *kvMeta) LoadMeta(r io.Reader) error {
 	if err != nil {
 		return err
 	}
-	m.Lock()
-	m.fmt = &dm.Setting
-	m.Unlock()
+	m.setFormat(&dm.Setting)
 
 	if err = m.loadDumpedACLs(Background()); err != nil {
 		return err
@@ -4532,7 +4584,6 @@ func (m *kvMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 				return eno
 			}
 			if attr.Typ != TypeDirectory {
-				now := time.Now()
 				pattr.Mtime = now.Unix()
 				pattr.Mtimensec = uint32(now.Nanosecond())
 				pattr.Ctime = now.Unix()
@@ -4585,7 +4636,8 @@ func (m *kvMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 		case TypeSymlink:
 			tx.set(m.symKey(ino), tx.get(m.symKey(srcIno)))
 		}
-		m.genLog(tx, time.Now(), "CLONE(%d,%d,%s,%d,%d,%d,%t):%d", srcIno, parent, logEncode2(name), ino, cmode, cumask, top, ino)
+		*originAttr = attr
+		m.genLog(tx, now, "CLONE(%d,%d,%s,%d,%d,%d,%t,%d,%s):%d", srcIno, parent, logEncode2(name), ino, cmode, cumask, top, ctx.Uid(), logGids(ctx), ino)
 		return nil
 	}, srcIno))
 }
@@ -4610,8 +4662,8 @@ func (m *kvMeta) doCleanupDetachedNode(ctx Context, ino Ino) syscall.Errno {
 	if err != nil || buf == nil {
 		return errno(err)
 	}
-	rmConcurrent := make(chan int, 10)
-	if eno := m.emptyDir(ctx, ino, true, nil, rmConcurrent); eno != 0 {
+	rmConcurrent := make(chan int, backgroundDeleteThreads)
+	if eno := m.emptyDir(withIgnoredAttrFlags(ctx), ino, true, nil, rmConcurrent); eno != 0 {
 		return eno
 	}
 	m.updateStats(-align4K(0), -1)
@@ -4807,6 +4859,15 @@ func (m *kvMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 			}
 			tx.set(m.symKey(sc.dstIno), target)
 		}
+		if m.getFormat().ChangeLog {
+			args := make([]string, 0, 2*len(cloneInfos))
+			inodes := make([]string, 0, len(cloneInfos))
+			for _, info := range cloneInfos {
+				args = append(args, strconv.FormatUint(uint64(info.srcIno), 10), logEncode2(info.name))
+				inodes = append(inodes, strconv.FormatUint(uint64(info.dstIno), 10))
+			}
+			m.genLog(tx, now, "CLONEBATCH(%d,%d,%d,%d,%s,%s):%s", dstParent, cmode, cumask, ctx.Uid(), logGids(ctx), strings.Join(args, ","), strings.Join(inodes, ","))
+		}
 
 		return nil
 	}, dstParent))
@@ -4925,7 +4986,7 @@ func (m *kvMeta) doSetFacl(ctx Context, ino Ino, aclType uint8, rule *aclAPI.Rul
 			attr.Ctime = now.Unix()
 			attr.Ctimensec = uint32(now.Nanosecond())
 			tx.set(m.inodeKey(ino), m.marshal(attr))
-			m.genLog(tx, now, "SETFACL(%d,%d,%s)", ino, aclType, logEncode(rule.Encode()))
+			m.genLog(tx, now, "SETFACL(%d,%d,%s,%d)", ino, aclType, logEncode(rule.Encode()), attr.Mode)
 		}
 		return nil
 	}, ino))
@@ -4961,6 +5022,9 @@ func (m *kvMeta) insertACL(tx *kvTxn, rule *aclAPI.Rule) (uint32, error) {
 	if rule == nil || rule.IsEmpty() {
 		return aclAPI.None, nil
 	}
+	if aclId := m.aclCache.GetId(rule); aclId != aclAPI.None {
+		return aclId, nil
+	}
 
 	if err := m.tryLoadMissACLs(tx); err != nil {
 		logger.Warnf("load miss acls error: %s", err)
@@ -4975,9 +5039,19 @@ func (m *kvMeta) insertACL(tx *kvTxn, rule *aclAPI.Rule) (uint32, error) {
 		aclId = uint32(newId)
 
 		tx.set(m.aclKey(aclId), rule.Encode())
-		m.aclCache.Put(aclId, rule)
+		m.cacheACL(tx, aclId, rule.Dup())
 	}
 	return aclId, nil
+}
+
+func (m *kvMeta) cacheACL(tx *kvTxn, id uint32, rule *aclAPI.Rule) {
+	if tx.onCommit != nil {
+		// A transaction may be reading its own uncommitted ACL writes.
+		tx.onCommit(func() { m.aclCache.Put(id, rule) })
+	} else {
+		// Read paths outside m.txn only see committed ACLs.
+		m.aclCache.Put(id, rule)
+	}
 }
 
 func (m *kvMeta) tryLoadMissACLs(tx *kvTxn) error {
@@ -4990,11 +5064,13 @@ func (m *kvMeta) tryLoadMissACLs(tx *kvTxn) error {
 
 		acls := tx.gets(missKeys...)
 		for i, data := range acls {
-			var rule aclAPI.Rule
-			if len(data) > 0 {
-				rule.Decode(data)
+			// Missing records may belong to transactions that have not committed yet.
+			if len(data) == 0 {
+				continue
 			}
-			m.aclCache.Put(missIds[i], &rule)
+			var rule aclAPI.Rule
+			rule.Decode(data)
+			m.cacheACL(tx, missIds[i], &rule)
 		}
 	}
 	return nil
@@ -5015,7 +5091,7 @@ func (m *kvMeta) getACL(tx *kvTxn, id uint32) (*aclAPI.Rule, error) {
 
 	rule := &aclAPI.Rule{}
 	rule.Decode(val)
-	m.aclCache.Put(id, rule)
+	m.cacheACL(tx, id, rule)
 	return rule, nil
 }
 
@@ -5141,7 +5217,12 @@ func (m *kvMeta) getDirFetcher() dirFetcher {
 		}
 
 		if cursor != nil {
-			keys, vals = keys[1:], vals[1:]
+			// The cursor may have been deleted concurrently
+			if len(keys) > 0 && bytes.Equal(keys[0], startKey) {
+				keys, vals = keys[1:], vals[1:]
+			} else if len(keys) > limit-1 {
+				keys, vals = keys[:limit-1], vals[:limit-1]
+			}
 		}
 
 		if total > limit && offset <= len(keys) {

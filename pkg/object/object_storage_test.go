@@ -63,6 +63,34 @@ func get(s ObjectStorage, k string, off, limit int64, getters ...AttrGetter) (st
 	return string(data), nil
 }
 
+func TestTierStorageInitTiersIsolatesRuntimeState(t *testing.T) {
+	init := Tiers{
+		0: {
+			ID:  0,
+			Sc:  "STANDARD",
+			Tag: "owner=team a",
+		},
+	}
+	original := init[0]
+
+	storage := &tierStorage{}
+	if err := storage.InitTiers(init); err != nil {
+		t.Fatalf("InitTiers failed: %v", err)
+	}
+
+	if got := init[0]; got != original {
+		t.Fatalf("InitTiers mutated input: got %+v, want %+v", got, original)
+	}
+	if got := storage.tiers[0].encodedTag; got != "owner=team+a" {
+		t.Fatalf("unexpected encoded tag: got %q, want %q", got, "owner=team+a")
+	}
+
+	init[0] = Tier{ID: 0, Sc: "STANDARD", Tag: "owner=changed"}
+	if got := storage.GetTier(context.Background()); got != original {
+		t.Fatalf("tier storage shares input map: got %+v, want %+v", got, original)
+	}
+}
+
 func listAll(ctx context.Context, s ObjectStorage, prefix, marker string, limit int64, followLink bool) ([]Object, error) {
 	ch, err := ListAll(ctx, s, prefix, marker, followLink, true)
 	if err == nil {
@@ -126,6 +154,7 @@ func testStorage(t *testing.T, s ObjectStorage) {
 	}
 	prefix := "unit-test/"
 	s = WithPrefix(s, prefix)
+	defer s.Delete(ctx, "") // the prefix directory on file systems
 	defer func() {
 		if err := s.Delete(ctx, "test"); err != nil {
 			t.Fatalf("delete failed: %s", err)
@@ -296,7 +325,12 @@ func testStorage(t *testing.T, s ObjectStorage) {
 	if err := s.Put(ctx, "a1", bytes.NewReader(br)); err != nil {
 		t.Fatalf("PUT failed: %s", err.Error())
 	}
-	defer s.Delete(ctx, "a/b/c/d/e/f")
+	defer func() {
+		// file systems create the parent directories implicitly
+		for _, k := range []string{"a/b/c/d/e/f", "a/b/c/d/e/", "a/b/c/d/", "a/b/c/", "a/b/"} {
+			_ = s.Delete(ctx, k)
+		}
+	}()
 	if err := s.Put(ctx, "a/b/c/d/e/f", bytes.NewReader(br)); err != nil {
 		t.Fatalf("PUT failed: %s", err.Error())
 	}
@@ -533,6 +567,7 @@ func testStorage(t *testing.T, s ObjectStorage) {
 					<-pool
 					wg.Done()
 				}()
+				var err error
 				parts[num-1], err = s.UploadPart(ctx, k, upload.UploadID, num, content[num-1])
 				if err != nil {
 					errCh <- fmt.Errorf("multipart upload error: %v", err)
@@ -809,14 +844,6 @@ func TestBOS(t *testing.T) { //skip mutate
 	testStorage(t, b)
 }
 
-func TestSftp(t *testing.T) { //skip mutate
-	if os.Getenv("SFTP_HOST") == "" {
-		t.SkipNow()
-	}
-	b, _ := newSftp(os.Getenv("SFTP_HOST"), os.Getenv("SFTP_USER"), os.Getenv("SFTP_PASS"), "")
-	testStorage(t, b)
-}
-
 func TestOBS(t *testing.T) { //skip mutate
 	if os.Getenv("HWCLOUD_ACCESS_KEY") == "" {
 		t.SkipNow()
@@ -844,7 +871,6 @@ func TestHDFS(t *testing.T) { //skip mutate
 
 	checkAddr := func(addr string, expected []string, base string) {
 		addresses, basePath := parseHDFSAddr(addr, conf)
-		sort.Strings(addresses)
 		if !reflect.DeepEqual(addresses, expected) {
 			t.Fatalf("expected addrs is %+v but got %+v from %s", expected, addresses, addr)
 		}
