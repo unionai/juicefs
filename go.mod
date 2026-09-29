@@ -157,6 +157,7 @@ require (
 	github.com/cheggaaa/pb v1.0.29 // indirect
 	github.com/clbanning/mxj v1.8.4 // indirect
 	github.com/clipperhouse/uax29/v2 v2.2.0 // indirect
+	github.com/cloudfoundry/gosigar v1.3.6 // indirect
 	github.com/cloudsoda/sddl v0.0.0-20250224235906-926454e91efc // indirect
 	github.com/cncf/xds/go v0.0.0-20260202195803-dba9d589def2 // indirect
 	github.com/coredns/coredns v1.4.0 // indirect
@@ -174,7 +175,6 @@ require (
 	github.com/djherbis/atime v1.0.0 // indirect
 	github.com/docker/go-units v0.5.0 // indirect
 	github.com/dswarbrick/smart v0.0.0-20190505152634-909a45200d6d // indirect
-	github.com/elastic/gosigar v0.14.2 // indirect
 	github.com/envoyproxy/go-control-plane/envoy v1.37.0 // indirect
 	github.com/envoyproxy/protoc-gen-validate v1.3.3 // indirect
 	github.com/fatih/color v1.16.0 // indirect
@@ -347,7 +347,7 @@ require (
 
 replace github.com/minio/minio v0.0.0-20210206053228-97fe57bba92c => github.com/juicedata/minio v0.0.0-20260915033819-47296b1b89b0
 
-replace github.com/hanwen/go-fuse/v2 => github.com/unionai/go-fuse/v2 v2.1.2-union.3
+replace github.com/hanwen/go-fuse/v2 => github.com/unionai/go-fuse/v2 v2.1.2-union.3.0.20260929045757-bc1941ef1c52
 
 replace github.com/dgrijalva/jwt-go v3.2.0+incompatible => github.com/golang-jwt/jwt v3.2.1+incompatible
 
@@ -381,3 +381,5 @@ exclude (
 	google.golang.org/grpc/stats/opentelemetry v0.0.0-20240907200651-3ffb98b2c93a
 	google.golang.org/grpc/stats/opentelemetry v0.0.0-20241028142157-ada6787961b3
 )
+
+replace github.com/lanrat/extsort => github.com/juicedata/extsort v1.0.2-0.20260716070150-94a8c0fbe780

@@ -62,17 +62,14 @@ func sliceRefs(ctx *cli.Context) error {
 		return fmt.Errorf("load setting: %s", err)
 	}
 
-	slices := make(map[meta.Ino][]meta.Slice)
-	if st := m.ListSlices(meta.Background(), slices, false, false, nil); st != 0 {
-		return fmt.Errorf("list slices: %s", st)
-	}
 	seen := make(map[uint64]struct{})
-	for _, ss := range slices {
-		for _, s := range ss {
-			if s.Id > 0 {
-				seen[s.Id] = struct{}{}
-			}
+	if st := m.ScanSlices(meta.Background(), &meta.ScanSlicesOption{}, func(_ meta.Ino, s meta.Slice) error {
+		if s.Id > 0 {
+			seen[s.Id] = struct{}{}
 		}
+		return nil
+	}); st != 0 {
+		return fmt.Errorf("scan slices: %s", st)
 	}
 	ids := make([]uint64, 0, len(seen))
 	for id := range seen {
