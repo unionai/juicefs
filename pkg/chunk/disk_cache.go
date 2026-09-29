@@ -100,7 +100,7 @@ type cacheStore struct {
 	used      int64
 	keys      KeyIndex
 	scanned   bool
-	stageFull bool
+	stageFull atomic.Bool // written by checkFreeSpace, read by stage() without the lock
 	rawFull   bool
 	checksum  string // checksum level
 	uploader  func(key, path string, force bool) bool
@@ -362,7 +362,7 @@ func (cache *cacheStore) isFull(usage DiskFreeRatio, stage bool) bool {
 func (cache *cacheStore) checkFreeSpace() {
 	for cache.available() {
 		usage := cache.curFreeRatio()
-		cache.stageFull = cache.isFull(usage, true)
+		cache.stageFull.Store(cache.isFull(usage, true))
 		cache.rawFull = cache.isFull(usage, false)
 		if cache.rawFull && cache.keys.name() != EvictionNone {
 			logger.Tracef("Cleanup cache when check free space (%s): free ratio (%d%%), space usage (%d%%), inodes usage (%d%%)", cache.dir, int(cache.freeRatio*100), int(usage.br*100), int(usage.fr*100))
@@ -786,7 +786,7 @@ func (cache *cacheStore) add(key string, size int32, atime uint32) {
 
 func (cache *cacheStore) stage(key string, data []byte, tierID uint8) (string, error) {
 	stagingPath := cache.stagePath(key)
-	if cache.stageFull {
+	if cache.stageFull.Load() {
 		return stagingPath, errStageFull
 	}
 	// Reserve the block's bytes before writing it, so concurrent writers
