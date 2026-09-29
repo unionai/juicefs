@@ -435,7 +435,7 @@ func (s *wSlice) upload(indx int) {
 			}, s.store.conf.PutTimeout)
 			if err != nil {
 				stageFailed = true
-				if !errors.Is(err, errStageConcurrency) {
+				if !errors.Is(err, errStageConcurrency) && !errors.Is(err, errStageBudget) {
 					s.store.stageBlockErrors.Add(1)
 					logger.Warnf("write %s to disk: %s, upload it directly", key, err)
 				}
