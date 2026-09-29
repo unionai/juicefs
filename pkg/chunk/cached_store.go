@@ -432,7 +432,7 @@ func (s *wSlice) upload(indx int) {
 				if !stageState.CompareAndSwap(stagePending, stageAbandoned) {
 					_ = s.store.bcache.removeStage(key)
 				}
-				if !errors.Is(err, errStageConcurrency) {
+				if !errors.Is(err, errStageConcurrency) && !errors.Is(err, errStageBudget) {
 					s.store.stageBlockErrors.Add(1)
 					logger.Warnf("write %s to disk: %s, upload it directly", key, err)
 				}

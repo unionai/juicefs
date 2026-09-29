@@ -347,7 +347,7 @@ require (
 
 replace github.com/minio/minio v0.0.0-20210206053228-97fe57bba92c => github.com/juicedata/minio v0.0.0-20260915033819-47296b1b89b0
 
-replace github.com/hanwen/go-fuse/v2 => github.com/unionai/go-fuse/v2 v2.1.2-union.3.0.20260929045757-bc1941ef1c52
+replace github.com/hanwen/go-fuse/v2 => github.com/unionai/go-fuse/v2 v2.1.2-union.3.0.20260929140957-de43f506ee85
 
 replace github.com/dgrijalva/jwt-go v3.2.0+incompatible => github.com/golang-jwt/jwt v3.2.1+incompatible
 

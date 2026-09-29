@@ -46,6 +46,10 @@ var (
 	stagingBlocks       atomic.Int64
 	errStageFull        = errors.New("space not enough on device")
 	errStageConcurrency = errors.New("concurrent staging limit reached")
+	// errStageBudget: staging this block would take the staged bytes past the
+	// cache's capacity (--cache-size). The writer uploads it directly instead,
+	// which is the backpressure that keeps a fast writer inside its budget.
+	errStageBudget = errors.New("staged bytes would exceed the cache size")
 )
 
 type cacheKey struct {
@@ -63,8 +67,15 @@ type pendingFile struct {
 }
 
 type diskCache struct {
-	id         string
-	totalPages int64
+	// stagedBytes is the original size of every block staged on disk and not
+	// yet removed after upload. Staged blocks are added to the cache with a
+	// negative size, so used never counts them; without this the only bound
+	// on staging was the disk's free-space ratio -- the node's disk, in a
+	// container -- and a writer that outran its uploads filled the
+	// container's writable layer past its ephemeral-storage limit.
+	stagedBytes atomic.Int64
+	id          string
+	totalPages  int64
 	sync.Mutex
 	dir           string
 	mode          os.FileMode
@@ -82,7 +93,7 @@ type diskCache struct {
 	used      int64
 	keys      KeyIndex
 	scanned   bool
-	stageFull bool
+	stageFull atomic.Bool // written by checkFreeSpace, read by stage() without the lock
 	rawFull   bool
 	checksum  string // checksum level
 	uploader  func(key, path string, force bool) bool
@@ -238,7 +249,7 @@ func (c *diskCache) enabled() bool {
 }
 
 func (c *diskCache) full() bool {
-	return c.used > c.capacity || (c.maxItems != 0 && int64(c.keys.len()) > c.maxItems)
+	return c.used+c.stagedBytes.Load() > c.capacity || (c.maxItems != 0 && int64(c.keys.len()) > c.maxItems)
 }
 
 func (cache *diskCache) checkErr(f func() error) error {
@@ -344,7 +355,7 @@ func (cache *diskCache) isFull(usage DiskFreeRatio, stage bool) bool {
 func (cache *diskCache) checkFreeSpace() {
 	for cache.available() {
 		usage := cache.curFreeRatio()
-		cache.stageFull = cache.isFull(usage, true)
+		cache.stageFull.Store(cache.isFull(usage, true))
 		cache.rawFull = cache.isFull(usage, false)
 		if cache.rawFull && cache.keys.name() != EvictionNone {
 			logger.Tracef("Cleanup cache when check free space (%s): free ratio (%d%%), space usage (%d%%), inodes usage (%d%%)", cache.dir, int(cache.freeRatio*100), int(usage.br*100), int(usage.fr*100))
@@ -422,6 +433,7 @@ func (cache *diskCache) refreshCacheKeys() {
 func (cache *diskCache) removeStage(key string) error {
 	var err error
 	if err = cache.removeFile(cache.stagePath(key)); err == nil {
+		cache.stagedBytes.Add(-int64(parseObjOrigSize(key)))
 		cache.m.stageBlocks.Sub(1)
 		cache.m.stageBlockBytes.Sub(float64(parseObjOrigSize(key)))
 		ledger.remove(key)
@@ -775,9 +787,22 @@ func (cache *diskCache) add(key string, size int32, atime uint32) {
 
 func (cache *diskCache) stage(key string, data []byte, tierID uint8) (string, error) {
 	stagingPath := cache.stagePath(key)
-	if cache.stageFull {
+	if cache.stageFull.Load() {
 		return stagingPath, errStageFull
 	}
+	// Reserve the block's bytes before writing it, so concurrent writers
+	// cannot all pass the check and overshoot the budget together.
+	size := int64(parseObjOrigSize(key))
+	if staged := cache.stagedBytes.Add(size); cache.capacity > 0 && staged > cache.capacity {
+		cache.stagedBytes.Add(-size)
+		return stagingPath, errStageBudget
+	}
+	reserved := true
+	defer func() {
+		if reserved {
+			cache.stagedBytes.Add(-size)
+		}
+	}()
 	if cache.maxStageWrite != 0 && stagingBlocks.Load() > int64(cache.maxStageWrite) {
 		return stagingPath, errStageConcurrency
 	}
@@ -785,6 +810,7 @@ func (cache *diskCache) stage(key string, data []byte, tierID uint8) (string, er
 	defer stagingBlocks.Add(-1)
 	err := cache.flushPage(stagingPath, data, false, tierID)
 	if err == nil {
+		reserved = false // the staged file now holds the reservation until removeStage
 		ledger.add(key, stagingPath)
 		cache.m.stageBlocks.Add(1)
 		cache.m.stageBlockBytes.Add(float64(len(data)))
@@ -826,7 +852,12 @@ func (cache *diskCache) cleanupFull() {
 		return
 	}
 
-	goal := cache.capacity * 95 / 100
+	// Staged blocks are not in used and cannot be evicted, but they take the
+	// same disk: leave room for them.
+	goal := cache.capacity*95/100 - cache.stagedBytes.Load()
+	if goal < 0 {
+		goal = 0
+	}
 	num := int64(cache.keys.len()) * 99 / 100
 	if cache.maxItems != 0 && num > cache.maxItems*99/100 {
 		num = cache.maxItems * 99 / 100
@@ -1049,6 +1080,7 @@ func (cache *diskCache) scanStaging() {
 			}
 			logger.Debugf("Found staging block: %s", path)
 			ledger.add(key, path)
+			cache.stagedBytes.Add(int64(origSize))
 			cache.m.stageBlocks.Add(1)
 			cache.m.stageBlockBytes.Add(float64(origSize))
 			cache.uploader(key, path, false)
