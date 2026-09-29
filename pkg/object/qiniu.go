@@ -31,12 +31,14 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/middleware"
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	smithymiddleware "github.com/aws/smithy-go/middleware"
 	"github.com/qiniu/go-sdk/v7/auth"
+	qiniuclient "github.com/qiniu/go-sdk/v7/client"
 	"github.com/qiniu/go-sdk/v7/storage"
 )
 
@@ -53,8 +55,10 @@ func (q *qiniu) String() string {
 }
 
 func (q *qiniu) InitTiers(_ Tiers) error {
-	// avoid panic when GetStorageClass
-	q.tiers = NewTiers("")
+	// Initialize tier 0 for callers that still pass the default tier ID.
+	if err := q.tierStorage.InitTiers(nil); err != nil {
+		return err
+	}
 	return notSupported
 }
 
@@ -62,14 +66,15 @@ func (q *qiniu) Limits() Limits {
 	return Limits{}
 }
 
-func (q *qiniu) download(key string, off, limit int64) (io.ReadCloser, error) {
+func (q *qiniu) download(ctx context.Context, key string, off, limit int64) (io.ReadCloser, error) {
 	deadline := time.Now().Add(time.Second * 3600).Unix()
 	url := storage.MakePrivateURL(q.cred, os.Getenv("QINIU_DOMAIN"), key, deadline)
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return nil, err
 	}
 	now := time.Now().UTC().Format(http.TimeFormat)
+	setUserAgent(req)
 	req.Header.Add("Date", now)
 	if off > 0 || limit > 0 {
 		if limit > 0 {
@@ -111,7 +116,7 @@ func (q *qiniu) Head(ctx context.Context, key string) (Object, error) {
 
 func (q *qiniu) Get(ctx context.Context, key string, off, limit int64, getters ...AttrGetter) (io.ReadCloser, error) {
 	if strings.HasPrefix(key, "/") && os.Getenv("QINIU_DOMAIN") != "" {
-		return q.download(key, off, limit)
+		return q.download(ctx, key, off, limit)
 	}
 	return q.s3client.Get(ctx, key, off, limit, getters...)
 }
@@ -218,7 +223,7 @@ func newQiniu(endpoint, accessKey, secretKey, token string) (ObjectStorage, erro
 		options.HTTPClient = httpClient
 		options.APIOptions = append(options.APIOptions, func(stack *smithymiddleware.Stack) error {
 			return v4.SwapComputePayloadSHA256ForUnsignedPayloadMiddleware(stack)
-		})
+		}, middleware.AddUserAgentKey(UserAgent))
 		options.RetryMaxAttempts = 1
 	})
 	s3c := s3client{bucket: bucket, s3: client, region: region}
@@ -241,6 +246,9 @@ func newQiniu(endpoint, accessKey, secretKey, token string) (ObjectStorage, erro
 		zone.SrcUpHosts = []string{"free-qvm-z0-xs.qiniup.com"}
 	}
 	cfg.Zone = zone
+	if err := qiniuclient.SetAppName(UserAgent); err != nil {
+		return nil, fmt.Errorf("set Qiniu User-Agent: %s", err)
+	}
 	cred := auth.New(accessKey, secretKey)
 	bucketManager := storage.NewBucketManager(cred, &cfg)
 	return &qiniu{s3c, bucketManager, cred, &cfg, ""}, nil

@@ -26,6 +26,10 @@ on:
         required: false
         default: false
 
+concurrency:
+  group: ${{ github.workflow }}-pr-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   build-matrix:
     runs-on: ubuntu-22.04
@@ -90,6 +94,7 @@ jobs:
           sudo META=${{matrix.meta}} .github/scripts/command/changelog.sh
     
       - name: Test Tier
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         timeout-minutes: 40
         env:
           AWS_ACCESS_KEY_ID: ${{secrets.CI_COVERAGE_AWS_AK}}
@@ -128,6 +133,11 @@ jobs:
         timeout-minutes: 10
         run: |
           sudo META=${{matrix.meta}} .github/scripts/command/fsck.sh
+
+      - name: Test Crash Consistency
+        timeout-minutes: 20
+        run: |
+          sudo META=${{matrix.meta}} .github/scripts/command/crash_consistency.sh
 
       - name: Test Gateway
         timeout-minutes: 10

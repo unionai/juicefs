@@ -174,6 +174,7 @@ func testMeta(t *testing.T, m Meta) {
 	testMetaClient(t, m)
 	testTruncateAndDelete(t, m)
 	testTrash(t, m)
+	testRenameOverRelinkedHardlink(t, m)
 	testParents(t, m)
 	testRemove(t, m)
 	testResolve(t, m)
@@ -181,6 +182,8 @@ func testMeta(t *testing.T, m Meta) {
 	testLocks(t, m)
 	testListLocks(t, m)
 	testConcurrentWrite(t, m)
+	testRace(t, m)
+	testXattr(t, m)
 	testCompaction(t, m, false)
 	time.Sleep(time.Second)
 	testCompaction(t, m, true)
@@ -205,11 +208,31 @@ func testMeta(t *testing.T, m Meta) {
 	testRenameDirStat(t, m)
 	testRenameDirStatWithTrash(t, m)
 	testClone(t, m)
+	testCleanupDetachedNodes(t, m)
 	testBatchClone(t, m)
 	testACL(t, m)
 	testKerberosToken(t, m)
 	base.conf.ReadOnly = true
 	testReadOnly(t, m)
+}
+
+func testXattr(t *testing.T, m Meta) {
+	t.Run("XattrInodeLifecycle", func(t *testing.T) {
+		ctx := Background()
+		var inode Ino
+		if st := m.Mknod(ctx, RootInode, "xattr-inode-lifecycle", TypeFile, 0644, 022, 0, "", &inode, nil); st != 0 {
+			t.Fatalf("mknod: %s", st)
+		}
+		if st := m.Unlink(ctx, RootInode, "xattr-inode-lifecycle"); st != 0 {
+			t.Fatalf("unlink: %s", st)
+		}
+		if st := m.SetXattr(ctx, inode, "user.test", []byte("orphan"), XattrCreateOrReplace); st != syscall.ENOENT {
+			t.Fatalf("setxattr after unlink: got %s, want %s", st, syscall.ENOENT)
+		}
+		if st := m.RemoveXattr(ctx, inode, "user.test"); st != syscall.ENOENT {
+			t.Fatalf("removexattr after unlink: got %s, want %s", st, syscall.ENOENT)
+		}
+	})
 }
 
 func testAccess(t *testing.T, m Meta) {
@@ -269,6 +292,16 @@ func testAccess(t *testing.T, m Meta) {
 	ctx = NewContext(1, 2, []uint32{2})
 	st = m.Access(ctx, testNode, MODE_MASK_R|MODE_MASK_W, attr)
 	assert.Equal(t, syscall.Errno(0), st)
+}
+
+type aclCacheWithMissCount struct {
+	aclAPI.Cache
+	missCalls int
+}
+
+func (c *aclCacheWithMissCount) GetMissIds() []uint32 {
+	c.missCalls++
+	return c.Cache.GetMissIds()
 }
 
 func testACL(t *testing.T, m Meta) {
@@ -391,6 +424,7 @@ func testACL(t *testing.T, m Meta) {
 	assert.True(t, rule3.IsEqual(rule2))
 
 	// subdir access acl
+	m.getBase().aclCache.Clear()
 	rule3 = &aclAPI.Rule{}
 	if st := m.GetFacl(ctx, subDirIno, aclAPI.TypeAccess, rule3); st != 0 {
 		t.Fatalf("getfacl error: %s", st)
@@ -399,6 +433,46 @@ func testACL(t *testing.T, m Meta) {
 	rule2.Mask &= (mode >> 3) & 7
 	rule2.Other &= mode & 7
 	assert.True(t, rule3.IsEqual(rule2))
+
+	t.Run("ACLCacheHitWithGaps", func(t *testing.T) {
+		base := m.getBase()
+		cache := &aclCacheWithMissCount{Cache: base.aclCache}
+		base.aclCache = cache
+		defer func() { base.aclCache = cache.Cache }()
+		require.NotEmpty(t, cache.Cache.GetMissIds())
+		aclID := cache.GetId(rule3)
+		require.NotEqual(t, uint32(aclAPI.None), aclID)
+
+		for i := 0; i < 2; i++ {
+			require.Zero(t, m.SetFacl(ctx, subDirIno, aclAPI.TypeAccess, rule3.Dup()))
+			var attr Attr
+			require.Zero(t, m.GetAttr(ctx, subDirIno, &attr))
+			assert.Equal(t, aclID, attr.AccessACL)
+			assert.Zero(t, cache.missCalls, "cached setfacl should not load missing ACLs")
+
+			name := fmt.Sprintf("acl-cache-%d", i)
+			var inode Ino
+			require.Zero(t, m.Mknod(ctx, testDirIno, name, TypeFile, mode, 0022, 0, "", &inode, &attr))
+			defer m.Unlink(ctx, testDirIno, name)
+			assert.Equal(t, aclID, attr.AccessACL)
+			assert.Equal(t, mode, attr.Mode)
+			assert.Zero(t, cache.missCalls, "cached inherited ACL should not load missing ACLs")
+		}
+
+		uncached := rule3.Dup()
+		uncached.NamedUsers = aclAPI.Entries{{Id: 1002, Perm: 4}}
+		require.Equal(t, uint32(aclAPI.None), cache.GetId(uncached))
+		require.Zero(t, m.SetFacl(ctx, subDirIno, aclAPI.TypeAccess, uncached))
+		assert.Positive(t, cache.missCalls, "uncached ACL should still load missing ACLs")
+		var attr Attr
+		require.Zero(t, m.GetAttr(ctx, subDirIno, &attr))
+		assert.NotEqual(t, aclID, attr.AccessACL)
+		assert.Equal(t, mode, attr.Mode)
+		cache.Clear()
+		var got aclAPI.Rule
+		require.Zero(t, m.GetFacl(ctx, subDirIno, aclAPI.TypeAccess, &got))
+		assert.True(t, got.IsEqual(uncached))
+	})
 
 	// case: set minimal default acl
 	rule = &aclAPI.Rule{
@@ -574,6 +648,19 @@ func testMetaClient(t *testing.T, m Meta) {
 	if base.sid != ses[0].Sid {
 		t.Fatalf("my sid %d != registered sid %d", base.sid, ses[0].Sid)
 	}
+	if err = base.en.doCleanStaleSession(base.sid); err != nil {
+		t.Fatalf("clean session: %s", err)
+	}
+	if err = base.en.doRefreshSession(); err != nil {
+		t.Fatalf("refresh session: %s", err)
+	}
+	restored, err := m.GetSession(base.sid, false)
+	if err != nil {
+		t.Fatalf("get restored session: %s", err)
+	}
+	if !reflect.DeepEqual(ses[0].SessionInfo, restored.SessionInfo) { // session should remain unchanged even after rejoining
+		t.Fatalf("restored session info changed: %+v != %+v", restored.SessionInfo, ses[0].SessionInfo)
+	}
 	go m.CleanStaleSessions(Background())
 
 	var parent, inode, dummyInode Ino
@@ -706,6 +793,36 @@ func testMetaClient(t *testing.T, m Meta) {
 			t.Fatalf("rmdir d3: %s", st)
 		}
 
+		fdCtx := newFuseDefaultCtx(10, 10) // uid=10, primary gid=10 only
+		var pf, ff Ino
+		if st := m.Mkdir(ctx, 1, "d_fuse", 0755, 0, 0, &pf, attr); st != 0 {
+			t.Fatalf("mkdir d_fuse: %s", st)
+		}
+		if st := m.SetAttr(ctx, pf, SetAttrUID|SetAttrGID, 0, &Attr{Uid: 10, Gid: 20}); st != 0 {
+			t.Fatalf("chown d_fuse: %s", st)
+		}
+		// chmod path (mergeAttr): chmod g+s on a dir whose group (20) is not caller's group
+		if st := m.SetAttr(fdCtx, pf, SetAttrMode, 0, &Attr{Mode: 02755}); st != 0 {
+			t.Fatalf("chmod g+s d_fuse: %s", st)
+		}
+		if st := m.GetAttr(fdCtx, pf, attr); st != 0 {
+			t.Fatalf("getattr d_fuse: %s", st)
+		} else if attr.Mode&02000 == 0 {
+			t.Fatalf("sgid should be kept in FUSE default mode (chmod)")
+		}
+		// create path (inheritMode): create a group-executable setgid file under the
+		// setgid parent dir whose group (20) is not in caller's Gids().
+		if st := m.Mknod(fdCtx, pf, "f_fuse", TypeFile, 02755, 0, 0, "", &ff, attr); st != 0 {
+			t.Fatalf("create f_fuse: %s", st)
+		} else if attr.Mode&02000 == 0 {
+			t.Fatalf("sgid should be kept in FUSE default mode (create)")
+		}
+		if st := m.Unlink(fdCtx, pf, "f_fuse"); st != 0 {
+			t.Fatalf("unlink f_fuse: %s", st)
+		}
+		if st := m.Rmdir(ctx, 1, "d_fuse"); st != 0 {
+			t.Fatalf("rmdir d_fuse: %s", st)
+		}
 	}
 	if st := m.Resolve(ctx2, 1, "/d1/d2", nil, nil, false); st != 0 && st != syscall.ENOTSUP {
 		t.Fatalf("resolve /d1/d2: %s", st)
@@ -1361,6 +1478,28 @@ func testLocks(t *testing.T, m Meta) {
 	if st := m.Flock(ctx, inode, o1, syscall.F_UNLCK, false); st != 0 {
 		t.Fatalf("flock unlock: %s", st)
 	}
+
+	// Regression: a BSD read-lock must be registered in the per-session index
+	// (locked$<sid>) exactly like a write-lock. Otherwise stale-session cleanup
+	// and GetSession(detail) cannot see it, so a read-lock left behind by a
+	// crashed holder is never released and blocks every future write-lock on
+	// the same inode with EAGAIN forever.
+	if st := m.Flock(ctx, inode, o1, syscall.F_RDLCK, false); st != 0 {
+		t.Fatalf("flock rlock: %s", st)
+	}
+	if r, ok := m.(*redisMeta); ok {
+		ms, err := r.rdb.SMembers(context.Background(), r.lockedKey(r.sid)).Result()
+		if err != nil {
+			t.Fatalf("SMembers %s: %s", r.lockedKey(r.sid), err)
+		}
+		if len(ms) != 1 {
+			t.Fatalf("read-lock not registered in session index: got %d entries, want 1", len(ms))
+		}
+	}
+	if st := m.Flock(ctx, inode, o1, syscall.F_UNLCK, false); st != 0 {
+		t.Fatalf("flock unlock: %s", st)
+	}
+
 	if r, ok := m.(*redisMeta); ok {
 		ms, err := r.rdb.SMembers(context.Background(), r.lockedKey(r.sid)).Result()
 		if err != nil {
@@ -1842,7 +1981,10 @@ func testCompaction(t *testing.T, m Meta, trash bool) {
 	}
 	p.Done()
 	sliceMap := make(map[Ino][]Slice)
-	if st := m.ListSlices(ctx, sliceMap, false, false, nil); st != 0 {
+	if st := m.ScanSlices(ctx, &ScanSlicesOption{}, func(ino Ino, s Slice) error {
+		sliceMap[ino] = append(sliceMap[ino], s)
+		return nil
+	}); st != 0 {
 		t.Fatalf("list all slices: %s", st)
 	}
 
@@ -1903,7 +2045,10 @@ func testCompaction(t *testing.T, m Meta, trash bool) {
 	_ = m.Write(ctx, inode, 0, uint32(0), Slice{Id: sliceId, Size: 1 << 20, Len: 64 << 10}, time.Now())
 	m.NewSlice(ctx, &sliceId)
 	_ = m.Write(ctx, inode, 0, uint32(128<<10), Slice{Id: sliceId, Size: 2 << 20, Len: 128 << 10}, time.Now())
-	_ = m.Write(ctx, inode, 0, uint32(0), Slice{Id: 0, Size: 1 << 20, Len: 1 << 20}, time.Now())
+	m.NewSlice(ctx, &sliceId)
+	if st := m.Write(ctx, inode, 0, uint32(0), Slice{Id: sliceId, Size: 1 << 20, Len: 1 << 20}, time.Now()); st != 0 {
+		t.Fatalf("write 0: %s", st)
+	}
 	if c, ok := m.(compactor); ok {
 		c.compactChunk(inode, 0, false, true, 0)
 	}
@@ -2018,6 +2163,268 @@ func testConcurrentWrite(t *testing.T, m Meta) {
 	}
 }
 
+func testRace(t *testing.T, m Meta) {
+	t.Run("TrashSliceClaim", func(t *testing.T) {
+		testTrashSliceClaimRace(t, m)
+	})
+	t.Run("SQLExactEdgeCAS", func(t *testing.T) {
+		db, ok := m.(*dbMeta)
+		if !ok {
+			t.Skip("SQL transaction invariant")
+		}
+		testSQLExactEdgeCAS(t, db)
+	})
+}
+
+func testSQLExactEdgeCAS(t *testing.T, m *dbMeta) {
+	insert := func(e *edge) {
+		t.Helper()
+		if _, err := m.db.Insert(e); err != nil {
+			t.Fatalf("insert edge %q: %s", e.Name, err)
+		}
+		if e.Id == 0 {
+			t.Fatalf("insert edge %q returned zero id", e.Name)
+		}
+	}
+	remove := func(id int64) {
+		t.Helper()
+		if _, err := m.db.ID(id).Delete(&edge{}); err != nil {
+			t.Errorf("remove edge %d: %s", id, err)
+		}
+	}
+	get := func(id int64) edge {
+		t.Helper()
+		var e edge
+		ok, err := m.db.ID(id).Get(&e)
+		if err != nil {
+			t.Fatalf("get edge %d: %s", id, err)
+		}
+		if !ok {
+			t.Fatalf("edge %d not found", id)
+		}
+		return e
+	}
+
+	t.Run("DeleteRejectsChangedIdentity", func(t *testing.T) {
+		original := edge{Parent: RootInode, Name: []byte("sql-c05-changed"), Inode: 101, Type: TypeFile}
+		insert(&original)
+		defer remove(original.Id)
+		stale := get(original.Id)
+		if n, err := m.db.ID(original.Id).Cols("inode", "type").Update(&edge{Inode: 102, Type: TypeSymlink}); err != nil || n != 1 {
+			t.Fatalf("replace edge identity: rows=%d err=%v", n, err)
+		}
+
+		_, err := m.db.Transaction(func(s *xorm.Session) (interface{}, error) { return nil, deleteEdge(s, &stale) })
+		if !errors.Is(err, errEdgeChanged) {
+			t.Fatalf("delete stale edge: got %v, want %v", err, errEdgeChanged)
+		}
+		current := get(original.Id)
+		if current.Inode != 102 || current.Type != TypeSymlink {
+			t.Fatalf("replacement edge changed: inode=%d type=%d", current.Inode, current.Type)
+		}
+	})
+
+	t.Run("UpdateRejectsABAIdentity", func(t *testing.T) {
+		original := edge{Parent: RootInode, Name: []byte("sql-c05-aba"), Inode: 201, Type: TypeFile}
+		insert(&original)
+		stale := get(original.Id)
+		if n, err := m.db.ID(original.Id).Delete(&edge{}); err != nil || n != 1 {
+			t.Fatalf("delete original edge: rows=%d err=%v", n, err)
+		}
+		replacement := edge{Parent: original.Parent, Name: original.Name, Inode: original.Inode, Type: original.Type}
+		insert(&replacement)
+		defer remove(replacement.Id)
+
+		_, err := m.db.Transaction(func(s *xorm.Session) (interface{}, error) {
+			return nil, updateEdge(s, &stale, &edge{Inode: 202, Type: TypeSymlink})
+		})
+		if !errors.Is(err, errEdgeChanged) {
+			t.Fatalf("update ABA edge: got %v, want %v", err, errEdgeChanged)
+		}
+		current := get(replacement.Id)
+		if current.Inode != original.Inode || current.Type != original.Type {
+			t.Fatalf("ABA replacement changed: inode=%d type=%d", current.Inode, current.Type)
+		}
+	})
+
+	t.Run("BatchAffectedRowsRollback", func(t *testing.T) {
+		first := edge{Parent: RootInode, Name: []byte("sql-c05-batch-first"), Inode: 301, Type: TypeFile}
+		second := edge{Parent: RootInode, Name: []byte("sql-c05-batch-second"), Inode: 302, Type: TypeFile}
+		insert(&first)
+		defer remove(first.Id)
+		insert(&second)
+		defer remove(second.Id)
+		stale := []edge{get(first.Id), get(second.Id)}
+		if n, err := m.db.ID(second.Id).Cols("inode").Update(&edge{Inode: 303}); err != nil || n != 1 {
+			t.Fatalf("replace batch edge identity: rows=%d err=%v", n, err)
+		}
+
+		_, err := m.db.Transaction(func(s *xorm.Session) (interface{}, error) { return nil, deleteEdges(s, stale) })
+		if !errors.Is(err, errEdgeChanged) {
+			t.Fatalf("delete stale edge batch: got %v, want %v", err, errEdgeChanged)
+		}
+		if current := get(first.Id); current.Inode != first.Inode {
+			t.Fatalf("first edge deletion was not rolled back: inode=%d", current.Inode)
+		}
+		if current := get(second.Id); current.Inode != 303 {
+			t.Fatalf("second replacement changed: inode=%d", current.Inode)
+		}
+	})
+}
+
+func testTrashSliceClaimRace(t *testing.T, m Meta) {
+	format := testFormat()
+	format.TrashDays = 1
+	if err := m.Init(format, false); err != nil {
+		t.Fatalf("init meta with trash: %v", err)
+	}
+	defer func() {
+		if err := m.Init(testFormat(), false); err != nil {
+			t.Fatalf("restore meta format: %v", err)
+		}
+	}()
+
+	if err := m.NewSession(false); err != nil {
+		t.Fatalf("new session: %v", err)
+	}
+	defer m.CloseSession()
+
+	ctx := Background()
+	_ = m.Unlink(ctx, RootInode, "race")
+	var inode Ino
+	if st := m.Create(ctx, RootInode, "race", 0650, 022, 0, &inode, nil); st != 0 {
+		t.Fatalf("create file: %s", st)
+	}
+	defer m.Unlink(ctx, RootInode, "race")
+
+	const sliceSize = 100
+	var liveSlice, delayedSlice uint64
+	if st := m.NewSlice(ctx, &liveSlice); st != 0 {
+		t.Fatalf("new live slice: %s", st)
+	}
+	if st := m.Write(ctx, inode, 0, 0, Slice{Id: liveSlice, Size: sliceSize, Len: sliceSize}, time.Now()); st != 0 {
+		t.Fatalf("write live slice: %s", st)
+	}
+	if st := m.NewSlice(ctx, &delayedSlice); st != 0 {
+		t.Fatalf("new delayed slice: %s", st)
+	}
+	if st := m.Write(ctx, inode, 0, sliceSize, Slice{Id: delayedSlice, Size: sliceSize, Len: sliceSize}, time.Now()); st != 0 {
+		t.Fatalf("write delayed slice: %s", st)
+	}
+	var copied uint64
+	if st := m.CopyFileRange(ctx, inode, 0, inode, ChunkSize, sliceSize, 0, &copied, nil); st != 0 {
+		t.Fatalf("copy live slice: %s", st)
+	} else if copied != sliceSize {
+		t.Fatalf("copied bytes: got %d, want %d", copied, sliceSize)
+	}
+
+	var mu sync.Mutex
+	deletedLive := 0
+	m.OnMsg(DeleteSlice, func(args ...interface{}) error {
+		if args[0].(uint64) == liveSlice {
+			mu.Lock()
+			deletedLive++
+			mu.Unlock()
+		}
+		return nil
+	})
+	m.OnMsg(CompactChunk, func(args ...interface{}) error { return nil })
+	compactor, ok := m.(compactor)
+	if !ok {
+		t.Fatalf("meta %s does not support compaction", m.Name())
+	}
+	compactor.compactChunk(inode, 0, false, true, 0)
+
+	var live []Slice
+	if st := m.Read(ctx, inode, 1, &live); st != 0 {
+		t.Fatalf("read live slice: %s", st)
+	}
+	if len(live) != 1 || live[0].Id != liveSlice {
+		t.Fatalf("live slice after compaction: got %+v, want %d", live, liveSlice)
+	}
+
+	base := m.getBase()
+	base.stopDeleteSliceTasks()
+	defer base.startDeleteSliceTasks()
+
+	ready := make(chan struct{}, 2)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseScanners := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseScanners()
+	scan := func(ss []Slice, _ int64) (bool, error) {
+		for _, s := range ss {
+			if s.Id == liveSlice {
+				select {
+				case ready <- struct{}{}:
+				default:
+				}
+				<-release
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+
+	errs := make(chan error, 2)
+	for range 2 {
+		go func() { errs <- m.ScanDeletedObject(ctx, scan, nil, nil, nil) }()
+	}
+	select {
+	case <-ready:
+	case err := <-errs:
+		t.Fatalf("scan returned before loading delayed slice: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for delayed slice scan")
+	}
+
+	concurrent := false
+	wait := time.Second
+	if m.Name() == "mysql" || m.Name() == "postgres" {
+		wait = 10 * time.Second
+	}
+	select {
+	case <-ready:
+		concurrent = true
+	case <-time.After(wait):
+	}
+	releaseScanners()
+	for range 2 {
+		select {
+		case err := <-errs:
+			if err != nil {
+				t.Fatalf("scan trash slices: %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("timed out waiting for trash slice scanners")
+		}
+	}
+	if (m.Name() == "mysql" || m.Name() == "postgres") && !concurrent {
+		t.Fatalf("meta %s did not run concurrent delayed-slice transactions", m.Name())
+	}
+
+	mu.Lock()
+	deletes := deletedLive
+	mu.Unlock()
+	if deletes != 0 {
+		t.Fatalf("live slice %d was deleted %d times", liveSlice, deletes)
+	}
+	remaining := 0
+	if err := m.ScanDeletedObject(ctx, func(ss []Slice, _ int64) (bool, error) {
+		for _, s := range ss {
+			if s.Id == liveSlice {
+				remaining++
+			}
+		}
+		return false, nil
+	}, nil, nil, nil); err != nil {
+		t.Fatalf("scan remaining trash slices: %v", err)
+	}
+	if remaining != 0 {
+		t.Fatalf("live slice remains in %d delayed entries", remaining)
+	}
+}
+
 func testTruncateAndDelete(t *testing.T, m Meta) {
 	m.OnMsg(DeleteSlice, func(args ...interface{}) error {
 		return nil
@@ -2056,7 +2463,10 @@ func testTruncateAndDelete(t *testing.T, m Meta) {
 	}
 	var total int64
 	slices := make(map[Ino][]Slice)
-	m.ListSlices(ctx, slices, false, false, func() { total++ })
+	m.ScanSlices(ctx, &ScanSlicesOption{Progress: func() { total++ }}, func(ino Ino, s Slice) error {
+		slices[ino] = append(slices[ino], s)
+		return nil
+	})
 	var totalSlices int
 	for _, ss := range slices {
 		totalSlices += len(ss)
@@ -2071,7 +2481,10 @@ func testTruncateAndDelete(t *testing.T, m Meta) {
 
 	time.Sleep(time.Millisecond * 100)
 	slices = make(map[Ino][]Slice)
-	m.ListSlices(ctx, slices, false, false, nil)
+	m.ScanSlices(ctx, &ScanSlicesOption{}, func(ino Ino, s Slice) error {
+		slices[ino] = append(slices[ino], s)
+		return nil
+	})
 	totalSlices = 0
 	for _, ss := range slices {
 		totalSlices += len(ss)
@@ -2523,6 +2936,61 @@ func testTrash(t *testing.T, m Meta) {
 	m.getBase().doCleanupTrash(Background(), format.TrashDays, true, nil)
 	if st := m.GetAttr(ctx2, TrashInode+1, attr); st != syscall.ENOENT {
 		t.Fatalf("getattr: %s", st)
+	}
+}
+
+func testRenameOverRelinkedHardlink(t *testing.T, m Meta) {
+	format := testFormat()
+	format.TrashDays = 1
+	if err := m.Init(format, false); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	defer func() {
+		if err := m.Init(testFormat(), false); err != nil {
+			t.Fatalf("init: %v", err)
+		}
+	}()
+	ctx := Background()
+	var file1, file2, ino Ino
+	var attr Attr
+	if st := m.Create(ctx, RootInode, "rl_file1", 0644, 022, 0, &file1, &attr); st != 0 {
+		t.Fatalf("create rl_file1: %s", st)
+	}
+	if st := m.Link(ctx, file1, RootInode, "rl_link", &attr); st != 0 {
+		t.Fatalf("link rl_file1 -> rl_link: %s", st)
+	}
+	if st := m.Unlink(ctx, RootInode, "rl_link"); st != 0 {
+		t.Fatalf("unlink rl_link: %s", st)
+	}
+	if st := m.Create(ctx, RootInode, "rl_file2", 0644, 022, 0, &file2, &attr); st != 0 {
+		t.Fatalf("create rl_file2: %s", st)
+	}
+	if st := m.Link(ctx, file1, RootInode, "rl_link", &attr); st != 0 {
+		t.Fatalf("relink rl_file1 -> rl_link: %s", st)
+	}
+	if st := m.Rename(ctx, RootInode, "rl_file2", RootInode, "rl_link", 0, &ino, &attr); st != 0 {
+		t.Fatalf("rename rl_file2 -> rl_link: %s", st)
+	}
+	if st := m.Lookup(ctx, RootInode, "rl_link", &ino, &attr, true); st != 0 {
+		t.Fatalf("lookup rl_link: %s", st)
+	}
+	if ino != file2 {
+		t.Fatalf("rl_link inode: expect %d, got %d", file2, ino)
+	}
+	if st := m.Lookup(ctx, RootInode, "rl_file1", &ino, &attr, true); st != 0 {
+		t.Fatalf("lookup rl_file1: %s", st)
+	}
+	if ino != file1 {
+		t.Fatalf("rl_file1 inode: expect %d, got %d", file1, ino)
+	}
+	if attr.Nlink != 2 {
+		t.Fatalf("rl_file1 nlink: expect 2 (original + trash), got %d", attr.Nlink)
+	}
+	if st := m.Unlink(ctx, RootInode, "rl_file1"); st != 0 {
+		t.Fatalf("unlink rl_file1: %s", st)
+	}
+	if st := m.Unlink(ctx, RootInode, "rl_link"); st != 0 {
+		t.Fatalf("unlink rl_link: %s", st)
 	}
 }
 
@@ -3054,6 +3522,28 @@ func testCheckAndRepair(t *testing.T, m Meta) {
 			t.Fatalf("d4Inode  attr: %+v", *dirAttr)
 		}
 	}
+
+	// doRepair should keep the given nlink when trustNlink is set
+	var before Attr
+	if st := m.GetAttr(Background(), d4Inode, &before); st != 0 {
+		t.Fatalf("getattr: %s", st)
+	}
+	fixed := before
+	fixed.Nlink = before.Nlink + 5
+	if st := m.getBase().en.doRepair(Background(), d4Inode, &fixed, true); st != 0 {
+		t.Fatalf("repair nlink of d4Inode: %s", st)
+	}
+	var after Attr
+	if st := m.GetAttr(Background(), d4Inode, &after); st != 0 {
+		t.Fatalf("getattr: %s", st)
+	}
+	if after.Nlink != before.Nlink+5 {
+		t.Fatalf("d4Inode nlink should be %d, but got %d", before.Nlink+5, after.Nlink)
+	}
+	after.Nlink = before.Nlink
+	if after != before {
+		t.Fatalf("d4Inode attr should not be changed: %+v -> %+v", before, after)
+	}
 }
 
 func testDirStat(t *testing.T, m Meta) {
@@ -3176,6 +3666,85 @@ func testDirStat(t *testing.T, m Meta) {
 		return m.GetDirStat(Background(), testInode)
 	}); err != nil {
 		t.Fatalf("test dir usage rmdir: %v", err)
+	}
+
+	// test BatchUnlink with duplicate hardlink names
+	dupFileName := "batch-dup-file"
+	dupLinkName := "batch-dup-link"
+	dupFileLength := uint64(4097)
+	var dupInode Ino
+	if st := m.Create(Background(), testInode, dupFileName, 0640, 022, 0, &dupInode, nil); st != 0 {
+		t.Fatalf("create duplicate batch file: %s", st)
+	}
+	if st := m.Fallocate(Background(), dupInode, 0, 0, dupFileLength, nil); st != 0 {
+		t.Fatalf("fallocate duplicate batch file: %s", st)
+	}
+	if st := m.Link(Background(), dupInode, testInode, dupLinkName, nil); st != 0 {
+		t.Fatalf("link duplicate batch file: %s", st)
+	}
+	if err := waitCheckResult(m, dirStat{2 * int64(dupFileLength), 2 * align4K(dupFileLength), 2}, func() (*dirStat, syscall.Errno) {
+		return m.GetDirStat(Background(), testInode)
+	}); err != nil {
+		t.Fatalf("test dir usage duplicate batch link: %v", err)
+	}
+
+	var dupLinkInode Ino
+	var dupLinkAttr Attr
+	if st := m.Lookup(Background(), testInode, dupLinkName, &dupLinkInode, &dupLinkAttr, false); st != 0 {
+		t.Fatalf("lookup duplicate batch link: %s", st)
+	}
+	if dupLinkInode != dupInode || dupLinkAttr.Nlink != 2 {
+		t.Fatalf("duplicate batch link attr: inode %d attr %+v", dupLinkInode, dupLinkAttr)
+	}
+	dupEntries := []*Entry{
+		{Inode: dupInode, Name: []byte(dupLinkName), Attr: &dupLinkAttr},
+		{Inode: dupInode, Name: []byte(dupLinkName), Attr: &dupLinkAttr},
+	}
+	var dupCount uint64
+	if st := m.getBase().BatchUnlink(Background(), testInode, dupEntries, &dupCount, true); st != 0 {
+		t.Fatalf("batch unlink duplicate hardlink: %s", st)
+	}
+	if dupCount != uint64(len(dupEntries)) {
+		t.Fatalf("batch unlink duplicate count: expect %d, got %d", len(dupEntries), dupCount)
+	}
+	if err := waitCheckResult(m, dirStat{int64(dupFileLength), align4K(dupFileLength), 1}, func() (*dirStat, syscall.Errno) {
+		return m.GetDirStat(Background(), testInode)
+	}); err != nil {
+		t.Fatalf("test dir usage duplicate batch unlink: %v", err)
+	}
+
+	var remainingInode Ino
+	var remainingAttr Attr
+	if st := m.Lookup(Background(), testInode, dupFileName, &remainingInode, &remainingAttr, false); st != 0 {
+		t.Fatalf("lookup remaining hardlink after duplicate batch unlink: %s", st)
+	}
+	if remainingInode != dupInode || remainingAttr.Nlink != 1 {
+		t.Fatalf("remaining hardlink attr: inode %d attr %+v", remainingInode, remainingAttr)
+	}
+	var removedInode Ino
+	var removedAttr Attr
+	if st := m.Lookup(Background(), testInode, dupLinkName, &removedInode, &removedAttr, false); st != syscall.ENOENT {
+		t.Fatalf("lookup removed duplicate hardlink: %s", st)
+	}
+	deleted := false
+	if err := m.ScanDeletedObject(Background(), nil, nil, nil, func(ino Ino, size uint64, ts int64) (bool, error) {
+		if ino == dupInode {
+			deleted = true
+		}
+		return false, nil
+	}); err != nil {
+		t.Fatalf("scan pending deleted files: %s", err)
+	}
+	if deleted {
+		t.Fatalf("inode %d was queued for deletion after duplicate batch unlink", dupInode)
+	}
+	if st := m.Unlink(Background(), testInode, dupFileName); st != 0 {
+		t.Fatalf("unlink duplicate batch file: %s", st)
+	}
+	if err := waitCheckResult(m, dirStat{0, 0, 0}, func() (*dirStat, syscall.Errno) {
+		return m.GetDirStat(Background(), testInode)
+	}); err != nil {
+		t.Fatalf("test dir usage duplicate batch cleanup: %v", err)
 	}
 }
 
@@ -4027,6 +4596,81 @@ func testClone(t *testing.T, m Meta) {
 	}
 }
 
+func testCleanupDetachedNodes(t *testing.T, m Meta) {
+	ctx := Background()
+	var srcDir, srcSub, srcFile Ino
+	if eno := m.Mkdir(ctx, RootInode, "detachedSrc", 0777, 022, 0, &srcDir, nil); eno != 0 {
+		t.Fatalf("mkdir detachedSrc: %s", eno)
+	}
+	if eno := m.Mkdir(ctx, srcDir, "sub", 0777, 022, 0, &srcSub, nil); eno != 0 {
+		t.Fatalf("mkdir sub: %s", eno)
+	}
+	if eno := m.Mknod(ctx, srcSub, "immutable", TypeFile, 0777, 022, 0, "", &srcFile, nil); eno != 0 {
+		t.Fatalf("mknod immutable: %s", eno)
+	}
+	if eno := m.SetAttr(ctx, srcFile, SetAttrFlag, 0, &Attr{Flags: FlagImmutable}); eno != 0 {
+		t.Fatalf("setattr immutable: %s", eno)
+	}
+	if eno := m.SetAttr(ctx, srcSub, SetAttrFlag, 0, &Attr{Flags: FlagAppend}); eno != 0 {
+		t.Fatalf("setattr sub: %s", eno)
+	}
+
+	// an interrupted clone leaves a detached tree behind: the entries are copied,
+	// but the top directory is never attached to its parent
+	var dstIno Ino
+	var count uint64
+	if eno := m.getBase().cloneEntry(ctx, srcDir, RootInode, "detachedDst", &dstIno, CLONE_MODE_PRESERVE_ATTR, 022, &count, true, make(chan struct{}, 4)); eno != 0 {
+		t.Fatalf("clone entry: %s", eno)
+	}
+	var dstSub, dstFile Ino
+	var dstAttr Attr
+	if eno := m.Lookup(ctx, dstIno, "sub", &dstSub, &dstAttr, false); eno != 0 {
+		t.Fatalf("lookup sub: %s", eno)
+	}
+	if eno := m.Lookup(ctx, dstSub, "immutable", &dstFile, &dstAttr, false); eno != 0 {
+		t.Fatalf("lookup immutable: %s", eno)
+	}
+	if dstAttr.Flags&FlagImmutable == 0 {
+		t.Fatalf("clone should copy attr flags, or the detached tree is reapable anyway")
+	}
+
+	edge := time.Now().Add(time.Minute)
+	detached := func() bool {
+		for _, ino := range m.(engine).doFindDetachedNodes(edge) {
+			if ino == dstIno {
+				return true
+			}
+		}
+		return false
+	}
+	if !detached() {
+		t.Fatalf("detached node %d not found", dstIno)
+	}
+	m.CleanupDetachedNodesBefore(ctx, edge, nil)
+	if detached() {
+		t.Fatalf("detached tree %d should be cleaned up", dstIno)
+	}
+	for _, ino := range []Ino{dstIno, dstSub, dstFile} {
+		if eno := m.GetAttr(ctx, ino, &dstAttr); eno != syscall.ENOENT {
+			t.Fatalf("inode %d of the detached tree should be removed: %s", ino, eno)
+		}
+	}
+
+	// removing a reachable immutable file is still not allowed
+	if eno := m.Remove(ctx, RootInode, "detachedSrc", false, RmrDefaultThreads, nil); eno != syscall.EPERM {
+		t.Fatalf("remove immutable file: %s", eno)
+	}
+	if eno := m.SetAttr(ctx, srcFile, SetAttrFlag, 0, &Attr{}); eno != 0 {
+		t.Fatalf("setattr immutable: %s", eno)
+	}
+	if eno := m.SetAttr(ctx, srcSub, SetAttrFlag, 0, &Attr{}); eno != 0 {
+		t.Fatalf("setattr sub: %s", eno)
+	}
+	if eno := m.Remove(ctx, RootInode, "detachedSrc", false, RmrDefaultThreads, nil); eno != 0 {
+		t.Fatalf("remove detachedSrc: %s", eno)
+	}
+}
+
 func checkEntryTree(t *testing.T, m Meta, srcIno, dstIno Ino, walkFunc func(srcEntry, dstEntry *Entry, dstIno Ino)) {
 	var entries1 []*Entry
 	if eno := m.Readdir(Background(), srcIno, 1, &entries1); eno != 0 {
@@ -4394,9 +5038,9 @@ func TestQuotaEdgeCases(t *testing.T) {
 	m.groupQuotas = make(map[uint64]*Quota)
 	m.quotaMu = sync.RWMutex{}
 
-	m.fmt = &Format{
+	m.setFormat(&Format{
 		UserGroupQuota: true,
-	}
+	})
 
 	fileOwnerUid := uint32(1001)
 	fileOwnerGid := uint32(2001)
@@ -4454,9 +5098,9 @@ func TestCheckQuotaFileOwner(t *testing.T) {
 	m.groupQuotas = make(map[uint64]*Quota)
 	m.quotaMu = sync.RWMutex{}
 
-	m.fmt = &Format{
+	m.setFormat(&Format{
 		UserGroupQuota: true,
-	}
+	})
 
 	fileOwnerUid := uint32(1001)
 	fileOwnerGid := uint32(2001)
@@ -6127,5 +6771,258 @@ func testBatchUnlinkWithUserGroupQuota(t *testing.T, m Meta, ctx Context, parent
 	}
 	if err := m.HandleQuota(ctx, QuotaDel, fmt.Sprintf("%d", gid), GroupQuotaType, nil, false, false, false); err != nil {
 		t.Fatalf("Delete group quota: %s", err)
+	}
+}
+
+// fuseDefaultCtx simulates FUSE default mode (NonDefaultPermission=false):
+// Gids() only returns the primary group and CheckPermission() returns false.
+type fuseDefaultCtx struct {
+	context.Context
+	pid uint32
+	uid uint32
+	gid uint32
+}
+
+func (c *fuseDefaultCtx) Uid() uint32           { return c.uid }
+func (c *fuseDefaultCtx) Gid() uint32           { return c.gid }
+func (c *fuseDefaultCtx) Gids() []uint32        { return []uint32{c.gid} }
+func (c *fuseDefaultCtx) Pid() uint32           { return c.pid }
+func (c *fuseDefaultCtx) Cancel()               {}
+func (c *fuseDefaultCtx) Canceled() bool        { return false }
+func (c *fuseDefaultCtx) CheckPermission() bool { return false }
+func (c *fuseDefaultCtx) WithValue(k, v interface{}) Context {
+	cp := *c
+	cp.Context = context.WithValue(c.Context, k, v)
+	return &cp
+}
+
+func newFuseDefaultCtx(uid, primaryGid uint32) *fuseDefaultCtx {
+	return &fuseDefaultCtx{
+		Context: context.Background(),
+		uid:     uid,
+		gid:     primaryGid,
+	}
+}
+
+// TestRedisStaleReadLockCleanup is a regression test for the gateway outage:
+// a read-lock whose holder crashed (no F_UNLCK) used to survive stale-session
+// cleanup, because F_RDLCK never added the inode to locked$<sid>, which is the
+// only thing doCleanStaleSession scans. The orphan R then made every F_WRLCK
+// on the same inode return EAGAIN forever. This test reproduces the crash +
+// cleanup + a fresh write-lock.
+func TestRedisStaleReadLockCleanup(t *testing.T) {
+	m, err := newRedisMeta("redis", "127.0.0.1:6379/10", testConfig())
+	if err != nil {
+		t.Fatalf("create meta: %s", err)
+	}
+	if err := m.Reset(); err != nil {
+		t.Fatalf("reset meta: %s", err)
+	}
+	if err := m.Init(testFormat(), false); err != nil {
+		t.Fatalf("init meta: %s", err)
+	}
+	if err := m.NewSession(true); err != nil {
+		t.Fatalf("new session: %s", err)
+	}
+	defer m.CloseSession() // err ignored: cleanup below already removed the session
+
+	r, ok := m.(*redisMeta)
+	if !ok {
+		t.Fatal("not a redisMeta")
+	}
+
+	ctx := Background()
+	var inode Ino
+	var attr = &Attr{}
+	if st := m.Create(ctx, 1, "f_stale_rlock", 0644, 0, 0, &inode, attr); st != 0 {
+		t.Fatalf("create f: %s", st)
+	}
+	defer m.Unlink(ctx, 1, "f_stale_rlock")
+
+	owner := uint64(0xF000000000000001)
+	if st := m.Flock(ctx, inode, owner, syscall.F_RDLCK, false); st != 0 {
+		t.Fatalf("flock rlock: %s", st)
+	}
+
+	// Simulate a crash: the holder dies without F_UNLCK. A surviving cleaner
+	// (any live client) eventually runs cleanup for this sid.
+	sid := r.sid
+	if err := r.doCleanStaleSession(sid); err != nil {
+		t.Fatalf("doCleanStaleSession: %s", err)
+	}
+
+	// (a) the orphan read-lock field must be gone from lockf$<inode>
+	if fields, err := r.rdb.HGetAll(ctx, r.flockKey(inode)).Result(); err != nil {
+		t.Fatalf("HGetAll %s: %s", r.flockKey(inode), err)
+	} else if len(fields) != 0 {
+		t.Fatalf("orphan read-lock survived stale-session cleanup: %v", fields)
+	}
+
+	// (b) the operational symptom: a fresh write-lock on the same inode must
+	// succeed now (previously it looped on EAGAIN against the dead R).
+	if st := m.Flock(ctx, inode, owner+1, syscall.F_WRLCK, false); st != 0 {
+		t.Fatalf("write-lock after cleanup should succeed, got %s", st)
+	}
+	_ = m.Flock(ctx, inode, owner+1, syscall.F_UNLCK, false)
+}
+
+// TestRedisLockIndexRelease covers the release side of the locked$<sid> index:
+// the index entry must be dropped as soon as no owner of the session holds a
+// lock on the inode, and must NOT be dropped while at least one owner does —
+// regardless of locks held by other sessions on the same inode.
+func TestRedisLockIndexRelease(t *testing.T) {
+	m1, err := newRedisMeta("redis", "127.0.0.1:6379/10", testConfig())
+	if err != nil {
+		t.Fatalf("create meta1: %s", err)
+	}
+	if err := m1.Reset(); err != nil {
+		t.Fatalf("reset meta1: %s", err)
+	}
+	if err := m1.Init(testFormat(), false); err != nil {
+		t.Fatalf("init meta1: %s", err)
+	}
+	if err := m1.NewSession(true); err != nil {
+		t.Fatalf("new session1: %s", err)
+	}
+	defer m1.CloseSession()
+
+	m2, err := newRedisMeta("redis", "127.0.0.1:6379/10", testConfig())
+	if err != nil {
+		t.Fatalf("create meta2: %s", err)
+	}
+	if _, err := m2.Load(true); err != nil {
+		t.Fatalf("load meta2: %s", err)
+	}
+	if err := m2.NewSession(true); err != nil {
+		t.Fatalf("new session2: %s", err)
+	}
+	defer m2.CloseSession()
+
+	r1, ok := m1.(*redisMeta)
+	if !ok {
+		t.Fatal("meta1 is not redisMeta")
+	}
+	r2, ok := m2.(*redisMeta)
+	if !ok {
+		t.Fatal("meta2 is not redisMeta")
+	}
+	ctx := Background()
+	var inode Ino
+	var attr = &Attr{}
+	if st := m1.Create(ctx, 1, "f_lockidx", 0644, 0, 0, &inode, attr); st != 0 {
+		t.Fatalf("create f: %s", st)
+	}
+	defer m1.Unlink(ctx, 1, "f_lockidx")
+
+	lockedLists := func(r *redisMeta, ino Ino) bool {
+		ms, err := r.rdb.SMembers(ctx, r.lockedKey(r.sid)).Result()
+		if err != nil {
+			t.Fatalf("SMembers %s: %s", r.lockedKey(r.sid), err)
+		}
+		for _, k := range ms {
+			if k == r.flockKey(ino) || k == r.plockKey(ino) {
+				return true
+			}
+		}
+		return false
+	}
+	fieldsOf := func(r *redisMeta, key string) map[string]string {
+		fields, err := r.rdb.HGetAll(ctx, key).Result()
+		if err != nil {
+			t.Fatalf("HGetAll %s: %s", key, err)
+		}
+		return fields
+	}
+
+	// BSD flock: two sessions share a read-lock; releasing in session1 must
+	// drop session1's index entry even though the hash is not globally empty
+	// (this is the leak the reviewer pointed at), and keep session2's lock.
+	if st := m1.Flock(ctx, inode, 1, syscall.F_RDLCK, false); st != 0 {
+		t.Fatalf("session1 rlock: %s", st)
+	}
+	if st := m2.Flock(ctx, inode, 1, syscall.F_RDLCK, false); st != 0 {
+		t.Fatalf("session2 rlock: %s", st)
+	}
+	if st := m1.Flock(ctx, inode, 1, syscall.F_UNLCK, false); st != 0 {
+		t.Fatalf("session1 unlock: %s", st)
+	}
+	if lockedLists(r1, inode) {
+		t.Fatalf("locked$%d still lists flock inode after the session released its last owner", r1.sid)
+	}
+	if fields := fieldsOf(r2, r2.flockKey(inode)); len(fields) != 1 {
+		t.Fatalf("session2 flock must survive session1 unlock, got %v", fields)
+	}
+	if st := m2.Flock(ctx, inode, 1, syscall.F_UNLCK, false); st != 0 {
+		t.Fatalf("session2 unlock: %s", st)
+	}
+	if lockedLists(r2, inode) {
+		t.Fatalf("locked$%d still lists flock inode", r2.sid)
+	}
+	if fields := fieldsOf(r1, r1.flockKey(inode)); len(fields) != 0 {
+		t.Fatalf("flock hash not empty: %v", fields)
+	}
+
+	// Same session, two owners: the index entry must survive until the last
+	// owner of the session releases.
+	if st := m1.Flock(ctx, inode, 1, syscall.F_RDLCK, false); st != 0 {
+		t.Fatalf("rlock owner1: %s", st)
+	}
+	if st := m1.Flock(ctx, inode, 2, syscall.F_RDLCK, false); st != 0 {
+		t.Fatalf("rlock owner2: %s", st)
+	}
+	if st := m1.Flock(ctx, inode, 1, syscall.F_UNLCK, false); st != 0 {
+		t.Fatalf("unlock owner1: %s", st)
+	}
+	if !lockedLists(r1, inode) {
+		t.Fatalf("locked$%d lost the flock inode while owner2 still holds it", r1.sid)
+	}
+	if st := m1.Flock(ctx, inode, 2, syscall.F_UNLCK, false); st != 0 {
+		t.Fatalf("unlock owner2: %s", st)
+	}
+	if lockedLists(r1, inode) {
+		t.Fatalf("locked$%d still lists flock inode after last owner released", r1.sid)
+	}
+
+	// POSIX locks: shared read ranges from two sessions; same leak, same fix.
+	if st := m1.Setlk(ctx, inode, 1, false, syscall.F_RDLCK, 0, 0xFFFF, 1); st != 0 {
+		t.Fatalf("session1 plock: %s", st)
+	}
+	if st := m2.Setlk(ctx, inode, 1, false, syscall.F_RDLCK, 0, 0xFFFF, 2); st != 0 {
+		t.Fatalf("session2 plock: %s", st)
+	}
+	if st := m1.Setlk(ctx, inode, 1, false, syscall.F_UNLCK, 0, 0xFFFF, 1); st != 0 {
+		t.Fatalf("session1 punlock: %s", st)
+	}
+	if lockedLists(r1, inode) {
+		t.Fatalf("locked$%d still lists plock inode after the session released its last owner", r1.sid)
+	}
+	if fields := fieldsOf(r2, r2.plockKey(inode)); len(fields) != 1 {
+		t.Fatalf("session2 plock must survive session1 unlock, got %v", fields)
+	}
+	if st := m2.Setlk(ctx, inode, 1, false, syscall.F_UNLCK, 0, 0xFFFF, 2); st != 0 {
+		t.Fatalf("session2 punlock: %s", st)
+	}
+	if lockedLists(r2, inode) {
+		t.Fatalf("locked$%d still lists plock inode", r2.sid)
+	}
+
+	// Same session, two plock owners: entry survives until the last owner.
+	if st := m1.Setlk(ctx, inode, 1, false, syscall.F_RDLCK, 0, 0xFFFF, 1); st != 0 {
+		t.Fatalf("plock owner1: %s", st)
+	}
+	if st := m1.Setlk(ctx, inode, 2, false, syscall.F_RDLCK, 0x10000, 0x20000, 2); st != 0 {
+		t.Fatalf("plock owner2: %s", st)
+	}
+	if st := m1.Setlk(ctx, inode, 1, false, syscall.F_UNLCK, 0, 0xFFFF, 1); st != 0 {
+		t.Fatalf("punlock owner1: %s", st)
+	}
+	if !lockedLists(r1, inode) {
+		t.Fatalf("locked$%d lost the plock inode while owner2 still holds it", r1.sid)
+	}
+	if st := m1.Setlk(ctx, inode, 2, false, syscall.F_UNLCK, 0x10000, 0x20000, 2); st != 0 {
+		t.Fatalf("punlock owner2: %s", st)
+	}
+	if lockedLists(r1, inode) {
+		t.Fatalf("locked$%d still lists plock inode after last owner released", r1.sid)
 	}
 }

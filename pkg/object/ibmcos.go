@@ -110,7 +110,7 @@ func (s *ibmcos) Restore(ctx context.Context, key string, days int32) error {
 }
 
 func (s *ibmcos) Put(ctx context.Context, key string, in io.Reader, getters ...AttrGetter) error {
-	t := s.GetTier(ctx)
+	t := s.getRuntimeTier(ctx)
 	var body io.ReadSeeker
 	if b, ok := in.(io.ReadSeeker); ok {
 		body = b
@@ -142,7 +142,7 @@ func (s *ibmcos) Put(ctx context.Context, key string, in io.Reader, getters ...A
 }
 
 func (s *ibmcos) Copy(ctx context.Context, dst, src string) error {
-	t := s.GetTier(ctx)
+	t := s.getRuntimeTier(ctx)
 	sc := getOrDefaultScValue(t.Sc, DefaultStorageClass)
 	src = s.bucket + "/" + src
 	params := &s3.CopyObjectInput{
@@ -343,6 +343,7 @@ func newIBMCOS(endpoint, apiKey, serviceInstanceID, token string) (ObjectStorage
 			authEndpoint, apiKey, serviceInstanceID)).
 		WithS3ForcePathStyle(defaultPathStyle())
 	sess := session.Must(session.NewSession())
+	sess.Handlers.Build.PushBack(request.MakeAddToUserAgentFreeFormHandler(UserAgent))
 	client := s3.New(sess, conf)
 	return &ibmcos{bucket: bucket, s3: client}, nil
 }

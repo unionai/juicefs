@@ -45,7 +45,10 @@ import (
 )
 
 const awsDefaultRegion = "us-east-1"
-const s3RequestIDKey = "X-Amz-Request-Id"
+
+func addS3UserAgent(stack *smithymiddleware.Stack) error {
+	return middleware.AddUserAgentKey(UserAgent)(stack)
+}
 
 type s3client struct {
 	tierStorage
@@ -74,11 +77,6 @@ func (s *s3client) Limits() Limits {
 		MaxPartSize:              5 << 30,
 		MaxPartCount:             10000,
 	}
-}
-
-func isExists(err error) bool {
-	msg := err.Error()
-	return strings.Contains(msg, "BucketAlreadyExists") || strings.Contains(msg, "BucketAlreadyOwnedByYou")
 }
 
 func (s *s3client) Create(ctx context.Context) error {
@@ -153,7 +151,7 @@ func (s *s3client) Get(ctx context.Context, key string, off, limit int64, getter
 }
 
 func (s *s3client) Put(ctx context.Context, key string, in io.Reader, getters ...AttrGetter) error {
-	t := s.GetTier(ctx)
+	t := s.getRuntimeTier(ctx)
 	var body io.ReadSeeker
 	if b, ok := in.(io.ReadSeeker); ok {
 		body = b
@@ -197,7 +195,7 @@ func (s *s3client) Put(ctx context.Context, key string, in io.Reader, getters ..
 }
 
 func (s *s3client) Copy(ctx context.Context, dst, src string) error {
-	t := s.GetTier(ctx)
+	t := s.getRuntimeTier(ctx)
 	sc := getOrDefaultScValue(t.Sc, string(types.StorageClassStandard))
 	src = s.bucket + "/" + src
 	params := &s3.CopyObjectInput{
@@ -479,13 +477,19 @@ func parseRegion(endpoint string) string {
 	return region
 }
 
-func defaultPathStyle() bool {
-	v := os.Getenv("JFS_S3_VHOST_STYLE")
-	return v == "" || v == "0" || v == "false"
-}
-
-var oracleCompileRegexp = `.*\.compat.objectstorage\.(.*)\.oraclecloud\.com`
+var oracleCompileRegexp = `^(?:.*\.)?(?:compat|vhcompat)\.objectstorage\.([^.]+)\.(?:oraclecloud\.com|oci\.customer-oci\.com)$`
 var OVHCompileRegexp = `^s3\.(\w*)(\.\w*)?\.cloud\.ovh\.net$`
+
+func parseOCIEndpoint(host string) (string, bool) {
+	compile := regexp.MustCompile(oracleCompileRegexp)
+	submatch := compile.FindStringSubmatch(host)
+	if len(submatch) != 2 {
+		return "", false
+	}
+	virtualHosted := strings.HasPrefix(host, "vhcompat.objectstorage.") ||
+		strings.Contains(host, ".vhcompat.objectstorage.")
+	return submatch[1], virtualHosted
+}
 
 func newS3(endpoint, accessKey, secretKey, token string) (ObjectStorage, error) {
 	if !strings.Contains(endpoint, "://") {
@@ -502,10 +506,12 @@ func newS3(endpoint, accessKey, secretKey, token string) (ObjectStorage, error) 
 	}
 
 	var (
-		bucketName string
-		region     string
-		ep         string
+		bucketName      string
+		region          string
+		ep              string
+		ociVirtualStyle bool
 	)
+	region, ociVirtualStyle = parseOCIEndpoint(uri.Hostname())
 
 	if uri.Path != "" {
 		// [ENDPOINT]/[BUCKET]
@@ -583,7 +589,7 @@ func newS3(endpoint, accessKey, secretKey, token string) (ObjectStorage, error) 
 		options.Region = region
 		options.APIOptions = append(options.APIOptions, func(stack *smithymiddleware.Stack) error {
 			return v4.SwapComputePayloadSHA256ForUnsignedPayloadMiddleware(stack)
-		})
+		}, addS3UserAgent)
 		options.RetryMaxAttempts = 1
 	})
 
@@ -602,7 +608,7 @@ func newS3(endpoint, accessKey, secretKey, token string) (ObjectStorage, error) 
 	if ep != "" {
 		optFns = append(optFns, func(options *s3.Options) {
 			options.BaseEndpoint = aws.String(uri.Scheme + "://" + ep)
-			options.UsePathStyle = defaultPathStyle()
+			options.UsePathStyle = defaultPathStyle() && !ociVirtualStyle
 		})
 	}
 	var cfg aws.Config

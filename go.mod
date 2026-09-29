@@ -1,6 +1,6 @@
 module github.com/juicedata/juicefs
 
-go 1.25.0
+go 1.25.10
 
 require (
 	cloud.google.com/go/compute/metadata v0.9.0
@@ -10,6 +10,7 @@ require (
 	github.com/Azure/azure-sdk-for-go/sdk/storage/azblob v1.6.4
 	github.com/DataDog/zstd v1.5.6
 	github.com/IBM/ibm-cos-sdk-go v1.13.0
+	github.com/VividCortex/ewma v1.2.0
 	github.com/agiledragon/gomonkey/v2 v2.6.0
 	github.com/aliyun/alibabacloud-oss-go-sdk-v2 v1.4.1
 	github.com/aliyun/credentials-go v1.4.5
@@ -54,8 +55,9 @@ require (
 	github.com/juju/ratelimit v1.0.2
 	github.com/ks3sdklib/aws-sdk-go v1.6.0
 	github.com/l0wl3vel/bunny-storage-go-sdk v1.0.0
+	github.com/lanrat/extsort v1.4.2
 	github.com/mattn/go-isatty v0.0.20
-	github.com/mattn/go-sqlite3 v1.14.24
+	github.com/mattn/go-sqlite3 v1.14.32
 	github.com/minio/cli v1.24.2
 	github.com/minio/minio v0.0.0-20210206053228-97fe57bba92c
 	github.com/minio/minio-go/v7 v7.0.11-0.20210302210017-6ae69c73ce78
@@ -78,13 +80,14 @@ require (
 	github.com/stretchr/testify v1.11.1
 	github.com/studio-b12/gowebdav v0.10.0
 	github.com/tencentyun/cos-go-sdk-v5 v0.7.73
-	github.com/tikv/client-go/v2 v2.0.7
-	github.com/tikv/pd/client v0.0.0-20230329114254-1948c247c2b1
+	github.com/tikv/client-go/v2 v2.0.8-0.20260615130046-a2b634d170d9
+	github.com/tikv/pd/client v0.0.0-20260609141937-b01426f6b08b
 	github.com/twmb/murmur3 v1.1.8
 	github.com/urfave/cli/v2 v2.19.3
 	github.com/vbauerster/mpb/v7 v7.0.3
 	github.com/viki-org/dnscache v0.0.0-20130720023526-c70c1f23c5d8
 	github.com/vimeo/go-util v1.4.1
+	github.com/vmihailenco/msgpack/v5 v5.4.1
 	github.com/vmware/go-nfs-client v0.0.0-20190605212624-d43b92724c1b
 	github.com/volcengine/ve-tos-golang-sdk/v2 v2.9.0
 	github.com/winfsp/cgofuse v1.6.0
@@ -125,7 +128,6 @@ require (
 	github.com/GoogleCloudPlatform/opentelemetry-operations-go/exporter/metric v0.53.0 // indirect
 	github.com/GoogleCloudPlatform/opentelemetry-operations-go/internal/resourcemapping v0.53.0 // indirect
 	github.com/IBM/go-sdk-core/v5 v5.21.2 // indirect
-	github.com/VividCortex/ewma v1.2.0 // indirect
 	github.com/acarl005/stripansi v0.0.0-20180116102854-5a71ef0e047d // indirect
 	github.com/alecthomas/participle v0.2.1 // indirect
 	github.com/alex-ant/gomath v0.0.0-20160516115720-89013a210a82 // indirect
@@ -155,6 +157,7 @@ require (
 	github.com/cheggaaa/pb v1.0.29 // indirect
 	github.com/clbanning/mxj v1.8.4 // indirect
 	github.com/clipperhouse/uax29/v2 v2.2.0 // indirect
+	github.com/cloudfoundry/gosigar v1.3.6 // indirect
 	github.com/cloudsoda/sddl v0.0.0-20250224235906-926454e91efc // indirect
 	github.com/cncf/xds/go v0.0.0-20260202195803-dba9d589def2 // indirect
 	github.com/coredns/coredns v1.4.0 // indirect
@@ -170,8 +173,8 @@ require (
 	github.com/dgryski/go-farm v0.0.0-20240924180020-3414d57e47da // indirect
 	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
 	github.com/djherbis/atime v1.0.0 // indirect
+	github.com/docker/go-units v0.5.0 // indirect
 	github.com/dswarbrick/smart v0.0.0-20190505152634-909a45200d6d // indirect
-	github.com/elastic/gosigar v0.14.2 // indirect
 	github.com/envoyproxy/go-control-plane/envoy v1.37.0 // indirect
 	github.com/envoyproxy/protoc-gen-validate v1.3.3 // indirect
 	github.com/fatih/color v1.16.0 // indirect
@@ -263,9 +266,9 @@ require (
 	github.com/pengsrc/go-shared v0.2.1-0.20190131101655-1999055a4a14 // indirect
 	github.com/philhofer/fwd v1.1.1 // indirect
 	github.com/pierrec/lz4 v2.5.2+incompatible // indirect
-	github.com/pingcap/errors v0.11.5-0.20211224045212-9687c2b0f87c // indirect
-	github.com/pingcap/failpoint v0.0.0-20220801062533-2eaa32854a6c // indirect
-	github.com/pingcap/kvproto v0.0.0-20230403051650-e166ae588106 // indirect
+	github.com/pingcap/errors v0.11.5-0.20241219054535-6b8c588c3122 // indirect
+	github.com/pingcap/failpoint v0.0.0-20240528011301-b51a646c7c86 // indirect
+	github.com/pingcap/kvproto v0.0.0-20260608025309-50b863799195 // indirect
 	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c // indirect
 	github.com/planetscale/vtprotobuf v0.6.1-0.20240319094008-0393e58bdf10 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
@@ -287,9 +290,9 @@ require (
 	github.com/spiffe/go-spiffe/v2 v2.8.1 // indirect
 	github.com/syndtr/goleveldb v1.0.0 // indirect
 	github.com/tiancaiamao/gp v0.0.0-20221230034425-4025bc8a4d4a // indirect
-	github.com/tidwall/gjson v1.6.7 // indirect
-	github.com/tidwall/match v1.0.3 // indirect
-	github.com/tidwall/pretty v1.0.2 // indirect
+	github.com/tidwall/gjson v1.19.0 // indirect
+	github.com/tidwall/match v1.1.1 // indirect
+	github.com/tidwall/pretty v1.2.0 // indirect
 	github.com/tidwall/sjson v1.0.4 // indirect
 	github.com/tinylib/msgp v1.1.3 // indirect
 	github.com/tklauser/go-sysconf v0.3.12 // indirect
@@ -297,6 +300,7 @@ require (
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
 	github.com/valyala/fasthttp v1.67.0 // indirect
 	github.com/valyala/tcplisten v1.0.0 // indirect
+	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	github.com/willf/bitset v1.1.11 // indirect
 	github.com/willf/bloom v2.0.3+incompatible // indirect
 	github.com/xrash/smetrics v0.0.0-20201216005158-039620a65673 // indirect
@@ -338,18 +342,18 @@ require (
 	storj.io/eventkit v0.0.0-20250410172343-61f26d3de156 // indirect
 	storj.io/infectious v0.0.2 // indirect
 	storj.io/picobuf v0.0.4 // indirect
-	xorm.io/builder v0.3.7 // indirect
+	xorm.io/builder v0.3.13 // indirect
 )
 
-replace github.com/minio/minio v0.0.0-20210206053228-97fe57bba92c => github.com/juicedata/minio v0.0.0-20260515071949-69a6cfc9da65
+replace github.com/minio/minio v0.0.0-20210206053228-97fe57bba92c => github.com/juicedata/minio v0.0.0-20260915033819-47296b1b89b0
 
-replace github.com/hanwen/go-fuse/v2 => github.com/unionai/go-fuse/v2 v2.1.2-union.3
+replace github.com/hanwen/go-fuse/v2 => github.com/unionai/go-fuse/v2 v2.1.2-union.3.0.20260929140957-de43f506ee85
 
 replace github.com/dgrijalva/jwt-go v3.2.0+incompatible => github.com/golang-jwt/jwt v3.2.1+incompatible
 
 replace github.com/vbauerster/mpb/v7 v7.0.3 => github.com/juicedata/mpb/v7 v7.0.4-0.20231024073412-2b8d31be510b
 
-replace xorm.io/xorm v1.0.7 => gitea.com/davies/xorm v1.0.8-0.20220528043536-552d84d1b34a
+replace xorm.io/xorm v1.0.7 => github.com/juicedata/xorm v1.4.2-0.20260909084754-f6c8d2b84ec2
 
 replace github.com/huaweicloud/huaweicloud-sdk-go-obs v3.21.12+incompatible => github.com/juicedata/huaweicloud-sdk-go-obs v3.22.12-0.20230228031208-386e87b5c091+incompatible
 
@@ -377,3 +381,5 @@ exclude (
 	google.golang.org/grpc/stats/opentelemetry v0.0.0-20240907200651-3ffb98b2c93a
 	google.golang.org/grpc/stats/opentelemetry v0.0.0-20241028142157-ada6787961b3
 )
+
+replace github.com/lanrat/extsort => github.com/juicedata/extsort v1.0.2-0.20260716070150-94a8c0fbe780

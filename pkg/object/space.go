@@ -45,8 +45,10 @@ func (s *space) Limits() Limits {
 }
 
 func (s *space) InitTiers(_ Tiers) error {
-	// avoid panic when GetStorageClass
-	s.tiers = NewTiers("")
+	// Initialize tier 0 for callers that still pass the default tier ID.
+	if err := s.tierStorage.InitTiers(nil); err != nil {
+		return err
+	}
 	return notSupported
 }
 
@@ -74,7 +76,7 @@ func newSpace(endpoint, accessKey, secretKey, token string) (ObjectStorage, erro
 		options.HTTPClient = httpClient
 		options.APIOptions = append(options.APIOptions, func(stack *smithymiddleware.Stack) error {
 			return v4.SwapComputePayloadSHA256ForUnsignedPayloadMiddleware(stack)
-		})
+		}, addS3UserAgent)
 		options.RetryMaxAttempts = 1
 	})
 	return &space{s3client{bucket: bucket, s3: client, region: region}}, nil

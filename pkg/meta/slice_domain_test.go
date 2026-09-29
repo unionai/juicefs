@@ -120,7 +120,7 @@ func TestSliceDomainZeroIsLegacy(t *testing.T) {
 	if st := m.NewSlice(ctx, &id); st != 0 {
 		t.Fatalf("NewSlice: %s", st)
 	}
-	if id >> sliceDomainShift != 0 {
+	if id>>sliceDomainShift != 0 {
 		t.Fatalf("legacy slice id %d has domain bits set", id)
 	}
 

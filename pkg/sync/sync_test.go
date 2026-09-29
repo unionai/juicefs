@@ -19,16 +19,24 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/rsa"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"reflect"
+	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/object"
+	"github.com/juju/ratelimit"
 )
 
 func collectAll(c <-chan object.Object) []string {
@@ -174,6 +182,71 @@ func TestSync(t *testing.T) {
 	// Forcibly copy {"a1", "a2", "abc","c1","c2","ba"} from a to b.
 	if err := Sync(a, b, config); err != nil {
 		t.Fatalf("sync: %s", err)
+	}
+}
+
+// Regression test for https://github.com/juicedata/juicefs/issues/7216.
+// --force-update may skip listing the destination only when --delete-dst does
+// not need that listing to find extraneous objects.
+func TestSyncForceUpdateDeleteDst(t *testing.T) {
+	testCases := []struct {
+		name        string
+		listThreads int
+		listDepth   int
+	}{
+		{name: "single listing thread", listThreads: 1, listDepth: 1},
+		{name: "parallel listing", listThreads: 2, listDepth: 2},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			src, _ := object.CreateStorage("file", t.TempDir()+"/", "", "", "")
+			dst, _ := object.CreateStorage("file", t.TempDir()+"/", "", "", "")
+
+			if err := src.Put(ctx, "shared/file", bytes.NewReader([]byte("new"))); err != nil {
+				t.Fatalf("put src shared/file: %s", err)
+			}
+			if err := src.Put(ctx, "src-only/file", bytes.NewReader([]byte("source"))); err != nil {
+				t.Fatalf("put src src-only/file: %s", err)
+			}
+			if err := dst.Put(ctx, "shared/file", bytes.NewReader([]byte("old"))); err != nil {
+				t.Fatalf("put dst shared/file: %s", err)
+			}
+			if err := dst.Put(ctx, "dst-only/file", bytes.NewReader([]byte("extra"))); err != nil {
+				t.Fatalf("put dst dst-only/file: %s", err)
+			}
+
+			if err := Sync(src, dst, &Config{
+				Threads:     4,
+				ListThreads: testCase.listThreads,
+				ListDepth:   testCase.listDepth,
+				ForceUpdate: true,
+				DeleteDst:   true,
+				Quiet:       true,
+				Limit:       -1,
+				MaxSize:     math.MaxInt64,
+			}); err != nil {
+				t.Fatalf("sync: %s", err)
+			}
+
+			reader, err := dst.Get(ctx, "shared/file", 0, -1)
+			if err != nil {
+				t.Fatalf("get dst shared/file: %s", err)
+			}
+			content, err := io.ReadAll(reader)
+			if err != nil {
+				t.Fatalf("read dst shared/file: %s", err)
+			}
+			if string(content) != "new" {
+				t.Fatalf("shared/file content = %q, want %q", content, "new")
+			}
+			if _, err := dst.Head(ctx, "src-only/file"); err != nil {
+				t.Fatalf("head dst src-only/file: %s", err)
+			}
+			if _, err := dst.Head(ctx, "dst-only/file"); !os.IsNotExist(err) {
+				t.Fatalf("head dst dst-only/file: %v, want not exist", err)
+			}
+		})
 	}
 }
 
@@ -620,6 +693,211 @@ func TestLimits(t *testing.T) {
 	}
 }
 
+// Regression test for the shared --limit budget between source processing and
+// destination-extra deletion. The budget is consumed by both deletions and
+// synced source objects; a source object is only counted in total after it
+// passes the limit check, so the run must not report it as "lost".
+func TestSyncLimitDeleteDstBoundary(t *testing.T) {
+	tmpSrc := t.TempDir() + "/"
+	tmpDst := t.TempDir() + "/"
+	src, _ := object.CreateStorage("file", tmpSrc, "", "", "")
+	dst, _ := object.CreateStorage("file", tmpDst, "", "", "")
+
+	// Source has a single new file "a2" that does not exist on the destination.
+	if err := src.Put(ctx, "a2", bytes.NewReader([]byte{})); err != nil {
+		t.Fatalf("put src a2: %s", err)
+	}
+	// Destination has a single extra file "a1" (sorts before "a2") only on dst.
+	if err := dst.Put(ctx, "a1", bytes.NewReader([]byte{})); err != nil {
+		t.Fatalf("put dst a1: %s", err)
+	}
+
+	// With --limit 2 the budget is exactly enough to delete "a1" and copy "a2":
+	// deleting "a1" consumes one unit and syncing "a2" consumes the last one.
+	// The current source object "a2" must still be synced rather than dropped.
+	config := &Config{
+		Threads:     50,
+		Update:      true,
+		Perms:       true,
+		MaxSize:     math.MaxInt64,
+		ListThreads: 1,
+		DeleteDst:   true,
+		Limit:       2,
+	}
+	if err := Sync(src, dst, config); err != nil {
+		t.Fatalf("sync: %s", err)
+	}
+
+	all, err := ListAll(dst, "", "", "", true)
+	if err != nil {
+		t.Fatalf("list all dst: %s", err)
+	}
+	if err := testKeysEqual(all, []string{"", "a2"}); err != nil {
+		t.Fatalf("testKeysEqual fail: %s", err)
+	}
+}
+
+// When --limit stops a partial sync before an extra destination directory is
+// emptied, deleting the directory is deferred rather than reported as a
+// failure. A later unlimited sync can remove the remaining contents and the
+// directory itself.
+func TestSyncLimitDeleteDstDefersNonEmptyDir(t *testing.T) {
+	t.Cleanup(func() {
+		dstDelayDelMu.Lock()
+		dstDelayDel = nil
+		dstDelayDelMu.Unlock()
+	})
+	tmpSrc := t.TempDir() + "/"
+	tmpDst := t.TempDir() + "/"
+	src, _ := object.CreateStorage("file", tmpSrc, "", "", "")
+	dst, _ := object.CreateStorage("file", tmpDst, "", "", "")
+
+	if err := dst.Put(ctx, "extra/file", bytes.NewReader([]byte("data"))); err != nil {
+		t.Fatalf("put dst extra/file: %s", err)
+	}
+
+	config := &Config{
+		Threads:     1,
+		ListThreads: 1,
+		Update:      true,
+		Dirs:        true,
+		DeleteDst:   true,
+		Limit:       2,
+		MaxSize:     math.MaxInt64,
+		Quiet:       true,
+	}
+	if err := Sync(src, dst, config); err != nil {
+		t.Fatalf("sync with exhausted limit: %s", err)
+	}
+
+	all, err := ListAll(dst, "", "", "", true)
+	if err != nil {
+		t.Fatalf("list all dst: %s", err)
+	}
+	if err := testKeysEqual(all, []string{"", "extra/", "extra/file"}); err != nil {
+		t.Fatalf("partial sync should retain non-empty directory: %s", err)
+	}
+}
+
+// Regression test: while deleting an extra dst object consumes part of the
+// --limit budget, the producer must still scan dstkeys to locate the current
+// source object's matching dst. Otherwise the object is treated as missing on
+// dst and gets copied/overwritten, breaking --ignore-existing (and similarly
+// --existing/--update).
+func TestSyncLimitDeleteDstIgnoreExisting(t *testing.T) {
+	tmpSrc := t.TempDir() + "/"
+	tmpDst := t.TempDir() + "/"
+	src, _ := object.CreateStorage("file", tmpSrc, "", "", "")
+	dst, _ := object.CreateStorage("file", tmpDst, "", "", "")
+
+	// Source has "a2" with new content.
+	if err := src.Put(ctx, "a2", bytes.NewReader([]byte("new"))); err != nil {
+		t.Fatalf("put src a2: %s", err)
+	}
+	// Destination has an extra "a1" (sorts before "a2") and an existing "a2"
+	// with different content that --ignore-existing must preserve.
+	if err := dst.Put(ctx, "a1", bytes.NewReader([]byte{})); err != nil {
+		t.Fatalf("put dst a1: %s", err)
+	}
+	if err := dst.Put(ctx, "a2", bytes.NewReader([]byte("old"))); err != nil {
+		t.Fatalf("put dst a2: %s", err)
+	}
+
+	// With --limit 2, deleting "a1" consumes one unit and locating/skipping the
+	// matching "a2" consumes the last one. The current source object "a2"
+	// already exists on dst, so --ignore-existing must skip it rather than
+	// overwrite it.
+	config := &Config{
+		Threads:        50,
+		Perms:          true,
+		MaxSize:        math.MaxInt64,
+		ListThreads:    1,
+		DeleteDst:      true,
+		IgnoreExisting: true,
+		Limit:          2,
+	}
+	if err := Sync(src, dst, config); err != nil {
+		t.Fatalf("sync: %s", err)
+	}
+
+	all, err := ListAll(dst, "", "", "", true)
+	if err != nil {
+		t.Fatalf("list all dst: %s", err)
+	}
+	if err := testKeysEqual(all, []string{"", "a2"}); err != nil {
+		t.Fatalf("testKeysEqual fail: %s", err)
+	}
+	c, err := dst.Get(ctx, "a2", 0, -1)
+	if err != nil {
+		t.Fatalf("get dst a2: %s", err)
+	}
+	data, _ := io.ReadAll(c)
+	if string(data) != "old" {
+		t.Fatalf("a2 should be preserved by --ignore-existing, got %q", string(data))
+	}
+}
+
+// Regression test for the "leftover dst" branch: a dst object retained from a
+// previous source iteration is deleted as extra for the current source object,
+// consuming part of the --limit budget. The producer must still scan dstkeys to
+// find the current object's matching dst instead of treating it as missing, so
+// that --ignore-existing is honored (the same applies to --existing/--update).
+func TestSyncLimitDeleteDstLeftoverIgnoreExisting(t *testing.T) {
+	tmpSrc := t.TempDir() + "/"
+	tmpDst := t.TempDir() + "/"
+	src, _ := object.CreateStorage("file", tmpSrc, "", "", "")
+	dst, _ := object.CreateStorage("file", tmpDst, "", "", "")
+
+	// Source: "a1" (new on dst) and "a4" (also present on dst).
+	if err := src.Put(ctx, "a1", bytes.NewReader([]byte("a1"))); err != nil {
+		t.Fatalf("put src a1: %s", err)
+	}
+	if err := src.Put(ctx, "a4", bytes.NewReader([]byte("new"))); err != nil {
+		t.Fatalf("put src a4: %s", err)
+	}
+	// Destination: extra "a2" (sorts between a1 and a4) and existing "a4".
+	if err := dst.Put(ctx, "a2", bytes.NewReader([]byte{})); err != nil {
+		t.Fatalf("put dst a2: %s", err)
+	}
+	if err := dst.Put(ctx, "a4", bytes.NewReader([]byte("old"))); err != nil {
+		t.Fatalf("put dst a4: %s", err)
+	}
+
+	// Processing "a1" reads and retains dst "a2" (a2 > a1). When processing
+	// "a4", the retained "a2" is deleted as extra, which consumes one unit of
+	// the shared budget (limit 3 = copy a1 + delete a2 + sync a4). The matching
+	// dst "a4" must still be located so --ignore-existing skips it instead of
+	// overwriting.
+	config := &Config{
+		Threads:        50,
+		Perms:          true,
+		MaxSize:        math.MaxInt64,
+		ListThreads:    1,
+		DeleteDst:      true,
+		IgnoreExisting: true,
+		Limit:          3,
+	}
+	if err := Sync(src, dst, config); err != nil {
+		t.Fatalf("sync: %s", err)
+	}
+
+	all, err := ListAll(dst, "", "", "", true)
+	if err != nil {
+		t.Fatalf("list all dst: %s", err)
+	}
+	if err := testKeysEqual(all, []string{"", "a1", "a4"}); err != nil {
+		t.Fatalf("testKeysEqual fail: %s", err)
+	}
+	c, err := dst.Get(ctx, "a4", 0, -1)
+	if err != nil {
+		t.Fatalf("get dst a4: %s", err)
+	}
+	data, _ := io.ReadAll(c)
+	if string(data) != "old" {
+		t.Fatalf("a4 should be preserved by --ignore-existing, got %q", string(data))
+	}
+}
+
 func testKeysEqual(objsCh <-chan object.Object, expectedKeys []string) error {
 	var gottenKeys []string
 	for obj := range objsCh {
@@ -996,5 +1274,274 @@ func TestSyncEncryptLargeFile(t *testing.T) {
 	got, _ := io.ReadAll(r)
 	if !bytes.Equal(got, largeData) {
 		t.Fatalf("decrypted large file mismatch: got %d bytes, want %d", len(got), len(largeData))
+	}
+}
+
+type progressReaderFunc func([]byte) (int, error)
+
+func (f progressReaderFunc) Read(b []byte) (int, error) { return f(b) }
+
+func TestWithProgressLimitsActualBytes(t *testing.T) {
+	const readSize = 1 << 20
+	local := ratelimit.NewBucket(time.Hour, 2*readSize)
+	oldLimiter, oldCopiedBytes := limiter, copiedBytes
+	limiter, copiedBytes = &mixedLimiter{local: local}, nil
+	t.Cleanup(func() { limiter, copiedBytes = oldLimiter, oldCopiedBytes })
+
+	data := []byte("abc")
+	source := bytes.NewReader(data)
+	readErr := errors.New("source read failed")
+	wantTokens := int64(2*readSize - len(data))
+	r := newProgressReader(progressReaderFunc(func(b []byte) (int, error) {
+		if got := local.Available(); got != wantTokens {
+			t.Fatalf("tokens before source read: got %d, want %d", got, wantTokens)
+		}
+		n, err := source.Read(b[:1])
+		if source.Len() == 0 && n > 0 {
+			err = readErr
+		}
+		return n, err
+	}), int64(len(data)))
+	b := make([]byte, readSize)
+	for _, wantErr := range []error{nil, nil, readErr} {
+		if n, err := r.Read(b); n != 1 || err != wantErr {
+			t.Fatalf("read: got (%d, %v), want (1, %v)", n, err, wantErr)
+		}
+	}
+	if n, err := r.Read(b); n != 0 || err != io.EOF {
+		t.Fatalf("final read: got (%d, %v), want (0, EOF)", n, err)
+	}
+	if got := local.Available(); got != wantTokens {
+		t.Fatalf("tokens after EOF: got %d, want %d", got, wantTokens)
+	}
+}
+
+func TestCopyLimitsSmallObject(t *testing.T) {
+	const readSize = 1 << 20
+	cases := []struct {
+		name string
+		body string
+		size int64
+		// wantTokens is the exact reservation expected, or -1 when the size is
+		// unknown and only the copied content matters.
+		wantTokens int64
+	}{
+		{"empty", "", 0, 0},
+		{"tiny", "x", 1, 1},
+		{"unknownSize", "hello", -1, -1},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			local := ratelimit.NewBucket(time.Hour, 2*readSize)
+			oldLimiter, oldCopiedBytes := limiter, copiedBytes
+			limiter, copiedBytes = &mixedLimiter{local: local}, nil
+			t.Cleanup(func() { limiter, copiedBytes = oldLimiter, oldCopiedBytes })
+
+			src, err := object.CreateStorage("mem", "", "", "", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			dst, err := object.CreateStorage("file", t.TempDir()+"/", "", "", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := src.Put(ctx, "key", strings.NewReader(c.body)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := doCopySingle0(src, dst, "key", c.size, false); err != nil {
+				t.Fatal(err)
+			}
+
+			in, err := dst.Get(ctx, "key", 0, -1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer in.Close()
+			got, err := io.ReadAll(in)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != c.body {
+				t.Fatalf("copied content: got %q, want %q", got, c.body)
+			}
+			if c.wantTokens >= 0 {
+				if used := int64(2*readSize) - local.Available(); used != c.wantTokens {
+					t.Fatalf("reserved tokens: got %d, want %d", used, c.wantTokens)
+				}
+			}
+		})
+	}
+}
+
+// TestMixedLimiterFailover verifies that the global traffic control takes
+// precedence, falls back to the local bwlimit when the global service is
+// unavailable, and switches back to the global limit once it recovers.
+func TestMixedLimiterFailover(t *testing.T) {
+	var up atomic.Bool
+	up.Store(true)
+	var granted atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !up.Load() {
+			http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		var in req
+		_ = json.Unmarshal(body, &in)
+		if in.Bytes > 0 {
+			granted.Add(in.Bytes)
+		}
+		out, _ := json.Marshal(resp{Granted: in.Bytes, Expired: 1000})
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(out)
+	}))
+	defer srv.Close()
+
+	gLimit := &globalLimit{address: srv.URL}
+	gLimit.healthy.Store(true)
+	// a tiny local limit as fallback
+	bps := float64(1e6)
+	local := ratelimit.NewBucketWithRate(bps, int64(bps))
+	l := &mixedLimiter{global: gLimit, local: local}
+
+	// while healthy, the global service should be used
+	l.Wait(1024)
+	if granted.Load() == 0 {
+		t.Fatalf("expected global service to be used while healthy")
+	}
+	if !gLimit.healthy.Load() {
+		t.Fatalf("expected global limit to stay healthy")
+	}
+
+	// take the service down: the next Wait should mark it unhealthy and fall back
+	up.Store(false)
+	before := granted.Load()
+	l.Wait(1 << 20) // exhausts remaining balance and triggers a failing request
+	if gLimit.healthy.Load() {
+		t.Fatalf("expected global limit to become unhealthy after failure")
+	}
+	// subsequent waits must not increase granted (global is skipped)
+	l.Wait(1024)
+	if granted.Load() != before {
+		t.Fatalf("expected global service to be skipped while unhealthy")
+	}
+
+	// bring the service back and probe for recovery
+	up.Store(true)
+	gLimit.lastProbe = time.Time{} // allow immediate probe
+	gLimit.checkBalance()
+	if !gLimit.healthy.Load() {
+		t.Fatalf("expected global limit to recover after service is back")
+	}
+}
+
+// TestGlobalLimitDrainWaitersOnFailure verifies that when the traffic-control
+// service becomes unavailable, the waiters already queued behind the head do
+// NOT each issue their own failing request. Only the first waiter that detects
+// the failure hits the (dead) service; the rest drain immediately and fall
+// back to the local bwlimit.
+func TestGlobalLimitDrainWaitersOnFailure(t *testing.T) {
+	var down atomic.Bool
+	var downReqs atomic.Int64
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if down.Load() {
+			downReqs.Add(1)
+			<-release // simulate an unresponsive/hung service
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		var in req
+		_ = json.Unmarshal(body, &in)
+		out, _ := json.Marshal(resp{Granted: in.Bytes, Expired: 1000})
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(out)
+	}))
+	defer srv.Close()
+
+	g := &globalLimit{address: srv.URL}
+	g.healthy.Store(true)
+
+	down.Store(true)
+	const n = 5
+	results := make(chan bool, n)
+	for i := 0; i < n; i++ {
+		go func() { results <- g.wait(1 << 20) }()
+	}
+
+	// wait until all goroutines are queued: the head is hung in request() while
+	// the others block as waiters behind it.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		g.Lock()
+		nw := len(g.waiters)
+		g.Unlock()
+		if nw == n {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("waiters did not queue up in time, got %d/%d", nw, n)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// release the hung request so the head fails and the queue drains.
+	close(release)
+	for i := 0; i < n; i++ {
+		if ok := <-results; ok {
+			t.Fatalf("expected wait to fall back (return false) while service is down")
+		}
+	}
+
+	if got := downReqs.Load(); got != 1 {
+		t.Fatalf("expected only 1 request to the down service, got %d", got)
+	}
+	if g.healthy.Load() {
+		t.Fatalf("expected global limit to be marked unhealthy")
+	}
+}
+
+func TestCopyDataWithoutProgress(t *testing.T) {
+	savedCopied, savedCopiedBytes := copied, copiedBytes
+	copied, copiedBytes = nil, nil
+	defer func() { copied, copiedBytes = savedCopied, savedCopiedBytes }()
+
+	src, err := object.CreateStorage("mem", "", "", "", "")
+	if err != nil {
+		t.Fatalf("create src: %s", err)
+	}
+	dst, err := object.CreateStorage("mem", "", "", "", "")
+	if err != nil {
+		t.Fatalf("create dst: %s", err)
+	}
+	data := bytes.Repeat([]byte("juicefs"), 50)
+	if err = src.Put(ctx, "backup", bytes.NewReader(data)); err != nil {
+		t.Fatalf("put: %s", err)
+	}
+	wantChksum := crc32.Checksum(data, crc32.MakeTable(crc32.Castagnoli))
+
+	settleGoroutines := func() {
+		runtime.GC()
+		time.Sleep(300 * time.Millisecond)
+		runtime.GC()
+	}
+	settleGoroutines()
+	base := runtime.NumGoroutine()
+
+	const cycles = 50
+	for i := 0; i < cycles; i++ {
+		chksum, err := CopyData(src, dst, "backup", int64(len(data)), true)
+		if err != nil {
+			t.Fatalf("CopyData: %s", err)
+		}
+		if chksum != wantChksum {
+			t.Fatalf("checksum mismatch: got %d, want %d", chksum, wantChksum)
+		}
+	}
+
+	settleGoroutines()
+	if leaked := runtime.NumGoroutine() - base; leaked > cycles/10 {
+		t.Fatalf("leaked %d goroutines after %d CopyData calls", leaked, cycles)
 	}
 }

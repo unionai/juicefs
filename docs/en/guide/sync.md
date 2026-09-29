@@ -193,6 +193,14 @@ juicefs sync /media/ "username:password"@192.168.1.100:/backup/
 
 When using the SFTP/SSH protocol, if no password is specified, the sync task will prompt for the password. If you want to explicitly specify the username and password, you need to enclose them in double quotation marks, with a colon separating the username and password.
 
+SFTP remote paths use the following formats:
+
+- Default SSH port: `username@host:/path`
+- Custom SSH port: `username@host:port:/path`
+- IPv6 with a custom SSH port: `username@[2001:db8::1]:2022:/path`
+
+When specifying a custom SSH port, the colon between the port and path is required and cannot be omitted. For example, use `username@192.168.1.100:2022:/backup/`, not `username@192.168.1.100:2022/backup/`. Colons after the remote path starts are treated as part of the path, so timestamped names such as `/backup/2026-07-23T05:53:21/` can be used without URL encoding.
+
 ## Sync behavior {#sync-behavior}
 
 ### Incremental and full synchronization {#incremental-and-full-synchronization}
@@ -343,7 +351,7 @@ The sync client and your traffic-control server communicate via a simple JSON-ov
 | Field | Type | Description |
 |-------|------|-------------|
 | `granted` | int64 | Number of bytes actually granted (equal to the requested amount for a blocking server). |
-| `expired` | int64 | Token validity in **milliseconds**. The client returns unused tokens before this expiration. |
+| `expired` | int64 | Token validity period in **milliseconds**. After the token expires, the client returns any unused tokens, if it has no pending bandwidth requests. |
 
 The client blocks on the POST request until the server responds, so the server's internal token bucket (or any other rate-limiting logic) is what enforces the global limit.
 
@@ -408,7 +416,9 @@ go run traffic_control_server.go
 juicefs sync --traffic-control-url http://10.0.0.1:8080/token s3://src/ s3://dst/
 ```
 
-`--bwlimit` and `--traffic-control-url` can be used together: `--bwlimit` sets a limit for each individual process, while `--traffic-control-url` enforces a global limit across all processes.
+`--bwlimit` and `--traffic-control-url` can be used together. On each rate-limiting check, sync tries the global traffic-control service first. If the service is unavailable, the current check falls back to the local `--bwlimit`. After the service recovers, subsequent checks use the global limit again. Ongoing waits that have already fallen back to `--bwlimit` are not interrupted when the service comes back. To make the fallback effective, set `--bwlimit` (per-process limit) to a value lower than the global cap.
+
+If `--traffic-control-url` is set without `--bwlimit`, there is no local fallback. While the traffic-control service is unavailable, sync transfers without any rate limit (logged as `run without rate limit`), and resumes the global limit once the service recovers.
 
 ## Observation {#observation}
 

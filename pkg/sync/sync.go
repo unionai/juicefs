@@ -68,7 +68,7 @@ var (
 	extra, extraBytes       *utils.Bar
 	deleted, failed         *utils.Bar
 	listedPrefix            *utils.Bar
-	concurrent              chan int
+	concurrent              = make(chan int, 10)
 	limiter                 *mixedLimiter
 	totalHandled            atomic.Int64
 )
@@ -79,12 +79,15 @@ type mixedLimiter struct {
 }
 
 func (l *mixedLimiter) Wait(count int64) {
-	if l.local != nil {
-		l.local.Wait(count)
+	if l.global != nil && l.global.healthy.Load() {
+		if l.global.wait(count) {
+			return
+		}
 	}
-	if l.global != nil {
-		l.global.wait(count)
+	if l.local == nil {
+		return
 	}
+	l.local.Wait(count)
 }
 
 type globalLimit struct {
@@ -94,7 +97,10 @@ type globalLimit struct {
 	need    int64
 	waiters []*sync.Cond
 
-	address string
+	address   string
+	localBW   int64
+	healthy   atomic.Bool
+	lastProbe time.Time
 }
 type req struct {
 	// Positive numbers indicate a request, negative numbers indicate a payback.
@@ -106,7 +112,17 @@ type resp struct {
 	Expired int64 `json:"expired"` // Millisecond
 }
 
-func (l *globalLimit) request(ask int64) (int64, int64, error) {
+func (l *globalLimit) request(ask int64) (granted int64, expired int64, err error) {
+	defer func() {
+		ok := err == nil
+		if prev := l.healthy.Swap(ok); prev && !ok {
+			if l.localBW > 0 {
+				logger.Warnf("traffic control %s is unavailable, switch to local bwlimit %s", l.address, utils.Mbps(l.localBW))
+			} else {
+				logger.Warnf("traffic control %s is unavailable, run without rate limit", l.address)
+			}
+		}
+	}()
 	r := req{Bytes: ask}
 	data, err := json.Marshal(r)
 	if err != nil {
@@ -118,7 +134,10 @@ func (l *globalLimit) request(ask int64) (int64, int64, error) {
 		if result != nil {
 			status = http.StatusText(result.StatusCode)
 		}
-		logger.Errorf("request traffic control %s failed: %s, http status: %s", l.address, err, status)
+		logger.Warnf("request traffic control %s failed: %s, http status: %s", l.address, err, status)
+		if err == nil {
+			err = fmt.Errorf("http status: %s", status)
+		}
 		return 0, 0, err
 	}
 	defer result.Body.Close()
@@ -127,18 +146,21 @@ func (l *globalLimit) request(ask int64) (int64, int64, error) {
 		return 0, 0, err
 	}
 	res := resp{}
-	if err := json.Unmarshal(content, &res); err != nil {
+	if err = json.Unmarshal(content, &res); err != nil {
 		return 0, 0, err
 	}
 	return res.Granted, res.Expired, nil
 }
 
-func (l *globalLimit) wait(bytes int64) {
+func (l *globalLimit) wait(bytes int64) bool {
 	l.Lock()
 	defer l.Unlock()
 	if bytes <= 0 || l.balance >= bytes && len(l.waiters) == 0 {
 		l.balance -= bytes
-		return
+		return true
+	}
+	if !l.healthy.Load() {
+		return false
 	}
 	l.need += bytes
 
@@ -148,33 +170,55 @@ func (l *globalLimit) wait(bytes int64) {
 		me.Wait()
 	}
 
-	if l.balance < bytes {
-		// request credit for other waiters together
-		ask := l.need - l.balance
-		if ask >= bytes*10 {
-			// don't wait for too long
-			ask = bytes * 10
-		}
-		l.Unlock()
-		granted, expire, err := l.request(ask)
-		l.Lock()
-		if err == nil {
-			l.balance += granted
-			l.due = time.Now().Add(time.Millisecond * time.Duration(expire))
-			logger.Debugf("grant %d from %s until %s", granted, l.address, l.due)
-		}
+	ok := l.balance >= bytes || l.requestMoreLocked(bytes)
+	if ok {
+		l.balance -= bytes
 	}
-
-	l.balance -= bytes
 	l.need -= bytes
 	l.waiters = l.waiters[1:]
 	if len(l.waiters) > 0 {
 		l.waiters[0].Signal()
 	}
+	return ok
+}
+
+func (l *globalLimit) requestMoreLocked(bytes int64) bool {
+	if !l.healthy.Load() {
+		return false
+	}
+	// request credit for other waiters together
+	ask := l.need - l.balance
+	if ask >= bytes*10 {
+		// don't wait for too long
+		ask = bytes * 10
+	}
+	l.Unlock()
+	granted, expire, err := l.request(ask)
+	l.Lock()
+	if err != nil {
+		return false
+	}
+	l.balance += granted
+	l.due = time.Now().Add(time.Millisecond * time.Duration(expire))
+	logger.Debugf("grant %d from %s until %s", granted, l.address, l.due)
+	return true
 }
 
 func (l *globalLimit) checkBalance() {
 	now := time.Now()
+	if !l.healthy.Load() {
+		if time.Since(l.lastProbe) >= time.Second {
+			l.lastProbe = now
+			if _, _, err := l.request(0); err == nil {
+				if l.localBW > 0 {
+					logger.Infof("traffic control %s recovered, switch back to global limit from local bwlimit %s", l.address, utils.Mbps(l.localBW))
+				} else {
+					logger.Infof("traffic control %s recovered, switch back to global limit", l.address)
+				}
+			}
+		}
+		return
+	}
 	l.Lock()
 	if l.balance > 0 && l.need == 0 && l.due.Before(now) {
 		payback := l.balance
@@ -377,6 +421,10 @@ func try(n int, f func() error) (err error) {
 }
 
 func deleteObj(storage object.ObjectStorage, key string, dry bool) error {
+	return deleteObjWithLimit(storage, key, dry, -1)
+}
+
+func deleteObjWithLimit(storage object.ObjectStorage, key string, dry bool, limit int64) error {
 	if dry {
 		logger.Debugf("Will delete %s from %s", key, storage)
 		deleted.Increment()
@@ -386,6 +434,9 @@ func deleteObj(storage object.ObjectStorage, key string, dry bool) error {
 	if err := try(3, func() error { return storage.Delete(ctx, key) }); err == nil {
 		deleted.Increment()
 		logger.Debugf("Deleted %s from %s in %s", key, storage, time.Since(start))
+		return nil
+	} else if limit == 0 {
+		logger.Warnf("Deferring deletion of non-empty directory %s from %s; the object limit may have been reached: %s", key, storage, err)
 		return nil
 	} else {
 		failed.Increment()
@@ -698,20 +749,35 @@ func doCopySingle0(src, dst object.ObjectStorage, key string, size int64, calChk
 	}
 	r := &chksumReader{in, 0, calChksum}
 	defer in.Close()
-	err = dst.Put(ctx, key, &withProgress{r})
+	err = dst.Put(ctx, key, newProgressReader(r, size))
 	return r.chksum, err
 }
 
 type withProgress struct {
-	r io.Reader
+	r        io.Reader
+	reserved int64 // bytes allowed but not yet consumed by a source read
+}
+
+func newProgressReader(r io.Reader, size int64) io.Reader {
+	p := &withProgress{r: r}
+	if size < 0 {
+		return p
+	}
+	return io.LimitReader(p, size)
 }
 
 func (w *withProgress) Read(b []byte) (int, error) {
-	if limiter != nil {
-		limiter.Wait(int64(len(b)))
+	if need := int64(len(b)) - w.reserved; need > 0 {
+		if limiter != nil {
+			limiter.Wait(need)
+		}
+		w.reserved += need
 	}
 	n, err := w.r.Read(b)
-	copiedBytes.IncrInt64(int64(n))
+	w.reserved -= int64(n)
+	if copiedBytes != nil {
+		copiedBytes.IncrInt64(int64(n))
+	}
 	return n, err
 }
 
@@ -745,9 +811,6 @@ func init() {
 }
 
 func doUploadPart(src, dst object.ObjectStorage, srckey string, off, size int64, key, uploadID string, num int, calChksum bool) (*object.Part, uint32, error) {
-	if limiter != nil {
-		limiter.Wait(size)
-	}
 	start := time.Now()
 	sz := size
 	var part *object.Part
@@ -759,15 +822,16 @@ func doUploadPart(src, dst object.ObjectStorage, srckey string, off, size int64,
 		}
 		defer in.Close()
 		r := &chksumReader{in, 0, calChksum}
+		pr := newProgressReader(r, size)
 		err = utils.ErrNotSUP
 		if obj, ok := dst.(object.SupportUploadPartStream); ok {
-			part, err = obj.UploadPartStream(key, uploadID, num+1, r)
+			part, err = obj.UploadPartStream(key, uploadID, num+1, pr)
 		}
 
 		if errors.Is(err, utils.ErrNotSUP) {
 			data := dynAlloc(int(size))
 			defer dynFree(data)
-			if _, err = io.ReadFull(r, data); err != nil {
+			if _, err = io.ReadFull(pr, data); err != nil {
 				return err
 			}
 			// PartNumber starts from 1
@@ -910,7 +974,6 @@ func doCopyMultiple(src, dst object.ObjectStorage, key string, size int64, mtime
 			parts[num], chksum, copyErr = doCopyRange(src, dst, key, int64(num)*partSize, sz, upload, num, abort, calChksum)
 			chksums[num] = chksumWithSz{chksum, sz}
 			if copyErr == nil {
-				copiedBytes.IncrInt64(sz)
 				if state != nil {
 					uploads.MarkMultipartPart(key, state, parts[num], chksum, calChksum)
 				}
@@ -949,13 +1012,6 @@ func doCopyMultiple(src, dst object.ObjectStorage, key string, size int64, mtime
 	}
 
 	return chksum, nil
-}
-
-func InitForCopyData() {
-	concurrent = make(chan int, 10)
-	progress := utils.NewProgress(true)
-	copied = progress.AddCountSpinner("Copied objects")
-	copiedBytes = progress.AddByteSpinner("Copied bytes")
 }
 
 func CopyData(src, dst object.ObjectStorage, key string, size int64, calChksum bool) (uint32, error) {
@@ -1326,14 +1382,16 @@ func handleExtraObject(tasks chan<- object.Object, dstobj object.Object, config 
 	if checkpointMgr.isCheckpointKey(dstobj.Key()) {
 		return false
 	}
-	incrTotal(1)
-	if !config.DeleteDst || !config.Dirs && dstobj.IsDir() || config.Limit == 0 {
+	if config.Limit == 0 {
+		return true
+	}
+	if !config.DeleteDst || !config.Dirs && dstobj.IsDir() {
 		logger.Debug("Ignore extra object", dstobj.Key())
 		extra.Increment()
 		extraBytes.IncrInt64(dstobj.Size())
 		return false
 	}
-	config.Limit--
+	incrTotal(1)
 	if dstobj.IsDir() {
 		dstDelayDelMu.Lock()
 		dstDelayDel = append(dstDelayDel, dstobj.Key())
@@ -1344,6 +1402,9 @@ func handleExtraObject(tasks chan<- object.Object, dstobj object.Object, config 
 			checkpointMgr.AddPendingKey(prefix, obj)
 		}
 		tasks <- obj
+	}
+	if config.Limit > 0 {
+		config.Limit--
 	}
 	return config.Limit == 0
 }
@@ -1365,7 +1426,7 @@ func startSingleProducer(tasks chan<- object.Object, src, dst object.ObjectStora
 	}
 
 	var dstkeys <-chan object.Object
-	if config.ForceUpdate {
+	if config.ForceUpdate && !config.DeleteDst {
 		t := make(chan object.Object)
 		close(t)
 		dstkeys = t
@@ -1431,13 +1492,6 @@ func produce(tasks chan<- object.Object, srckeys, dstkeys <-chan object.Object, 
 			logger.Debug("Ignore directory ", obj.Key())
 			continue
 		}
-		if config.Limit >= 0 {
-			if config.Limit == 0 {
-				return nil
-			}
-			config.Limit--
-		}
-		incrTotal(1)
 
 		if dstobj != nil && obj.Key() > dstobj.Key() {
 			if handleExtraObject(tasks, dstobj, config, checkpointMgr, prefix) {
@@ -1460,6 +1514,13 @@ func produce(tasks chan<- object.Object, srckeys, dstkeys <-chan object.Object, 
 			}
 		}
 
+		if config.Limit >= 0 {
+			if config.Limit == 0 {
+				return nil
+			}
+			config.Limit--
+		}
+		incrTotal(1)
 		// FIXME: there is a race when source is modified during coping
 		if dstobj == nil || obj.Key() < dstobj.Key() {
 			if config.Existing {
@@ -1483,12 +1544,12 @@ func produce(tasks chan<- object.Object, srckeys, dstkeys <-chan object.Object, 
 				sendTask(withSize(obj, markChecksum))
 			} else if config.DeleteSrc {
 				if obj.IsDir() {
-					if checkpointMgr != nil {
-						checkpointMgr.UpdateLastListedKey(prefix, obj)
-					}
 					srcDelayDelMu.Lock()
 					srcDelayDel = append(srcDelayDel, obj.Key())
 					srcDelayDelMu.Unlock()
+					if checkpointMgr != nil {
+						checkpointMgr.UpdateLastListedKey(prefix, obj)
+					}
 				} else {
 					sendTask(withSize(obj, markDeleteSrc))
 				}
@@ -1879,8 +1940,19 @@ var ignoreFiles int64
 func produceSingleObject(tasks chan<- object.Object, src, dst object.ObjectStorage, key string, config *Config, checkpointMgr *CheckpointManager) error {
 	obj, err := src.Head(ctx, key)
 	if err != nil {
-		logger.Warnf("head %s from %s: %s", key, src, err)
-		return err
+		if config.Links && (errors.Is(err, utils.ErrExtlink) || errors.Is(err, syscall.ENOTSUP) || errors.Is(err, os.ErrNotExist)) {
+			if sl, ok := src.(object.SupportSymlink); ok {
+				if target, e := sl.Readlink(key); e == nil {
+					obj, err = object.NewSymlink(key, target), nil
+				} else {
+					err = fmt.Errorf("readlink %s from %s: %w", key, src, e)
+				}
+			}
+		}
+		if err != nil {
+			logger.Warnf("head %s from %s: %s", key, src, err)
+			return err
+		}
 	}
 	if obj.IsDir() && (!config.Links || !obj.IsSymlink()) {
 		// only `files-from` will hit this case
@@ -2011,7 +2083,7 @@ func startProducer(tasks chan<- object.Object, src, dst object.ObjectStorage, pr
 		dcp = commonPrefix // search common prefix in dst
 	}
 	var dstkeys <-chan object.Object
-	if config.ForceUpdate {
+	if config.ForceUpdate && !config.DeleteDst {
 		t := make(chan object.Object)
 		close(t)
 		dstkeys = t
@@ -2095,7 +2167,6 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 			uploads = workerUploads
 		}
 	}
-
 	if strings.HasPrefix(src.String(), "file://") && strings.HasPrefix(dst.String(), "file://") {
 		major, minor := utils.GetKernelVersion()
 		// copy_file_range() system call first appeared in Linux 4.5, and reworked in 5.3
@@ -2129,7 +2200,8 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 	}
 	var gLimit *globalLimit
 	if config.TrafficControlURL != "" {
-		gLimit = &globalLimit{address: config.TrafficControlURL}
+		gLimit = &globalLimit{address: config.TrafficControlURL, localBW: config.BWLimit}
+		gLimit.healthy.Store(true)
 		go func() {
 			for {
 				time.Sleep(time.Millisecond * 10)
@@ -2230,23 +2302,25 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 			if failed != nil {
 				msg += fmt.Sprintf(", failed: %d", failed.Current())
 			}
-			if total-handled.Current()-extra.Current() > 0 {
-				msg += fmt.Sprintf(", lost: %d", total-handled.Current()-extra.Current())
+			if total-handled.Current() > 0 {
+				msg += fmt.Sprintf(", lost: %d", total-handled.Current())
 			}
 			logger.Info(msg)
 
 			if failed != nil {
-				if n := failed.Current(); n > 0 || total > handled.Current()+extra.Current() {
+				if n := failed.Current(); n > 0 || total > handled.Current() {
 					if checkpointMgr != nil {
 						if e := checkpointMgr.Save(checkpointMgr.checkpoint); e != nil {
 							logger.Warnf("Failed to save checkpoint after failure: %v", e)
 						}
 					}
-					return fmt.Errorf("failed to handle %d objects", n+total-handled.Current()-extra.Current())
+					return fmt.Errorf("failed to handle %d objects", n+total-handled.Current())
 				}
 			}
-			if checkpointMgr != nil {
-				if e := checkpointMgr.DeleteCheckpoint(); e != nil {
+			if checkpointMgr != nil && !config.Dry {
+				if e := try(3, func() error {
+					return checkpointMgr.DeleteCheckpoint()
+				}); e != nil {
 					logger.Warnf("Failed to delete checkpoint after completion: %v", e)
 				}
 			}
@@ -2352,7 +2426,7 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 			}
 			for i := len(keys) - 1; i >= 0; i-- {
 				incrHandled(1)
-				_ = deleteObj(storage, keys[i], config.Dry)
+				_ = deleteObjWithLimit(storage, keys[i], config.Dry, config.Limit)
 			}
 		}
 		delWg := sync.WaitGroup{}
@@ -2364,9 +2438,6 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 		}()
 		delWg.Add(1)
 		go func() {
-			if checkpointMgr != nil && config.DeleteDst {
-				delayDelFunc(checkpointMgr.dst, []string{checkpointMgr.checkpointKey})
-			}
 			delayDelFunc(dst, dstDelayDel)
 			delWg.Done()
 		}()

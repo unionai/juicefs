@@ -33,14 +33,14 @@ import (
 
 const mib = 1 << 20
 
-func budgetStore(t *testing.T, capacity int64) *cacheStore {
+func budgetStore(t *testing.T, capacity int64) *diskCache {
 	t.Helper()
 	freshLedger(t)
 	conf := testConf()
 	t.Cleanup(func() { _ = os.RemoveAll(conf.CacheDir) })
 	m := new(cacheManagerMetrics)
 	m.initMetrics()
-	return newCacheStore(m, conf.CacheDir, capacity, conf.CacheItems, 1, &conf, nil)
+	return newDiskCache(m, conf.CacheDir, capacity, conf.CacheItems, 1, &conf, nil)
 }
 
 func blockKey(id int) string { return fmt.Sprintf("%d_0_%d", id, 4*mib) }

@@ -95,14 +95,17 @@ func (q *bosclient) Get(ctx context.Context, key string, off, limit int64, gette
 	var r *api.GetObjectResult
 	var needCheck bool
 	if limit > 0 {
-		r, err = q.c.GetObject(q.bucket, key, nil, off, off+limit-1)
+		r, err = q.c.GetObjectWithContext(ctx, q.bucket, key, nil, off, off+limit-1)
 	} else if off > 0 {
-		r, err = q.c.GetObject(q.bucket, key, nil, off)
+		r, err = q.c.GetObjectWithContext(ctx, q.bucket, key, nil, off)
 	} else {
-		r, err = q.c.GetObject(q.bucket, key, nil)
+		r, err = q.c.GetObjectWithContext(ctx, q.bucket, key, nil)
 		needCheck = true
 	}
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			err = ctxErr
+		}
 		return
 	}
 	if needCheck {
@@ -140,7 +143,7 @@ func (q *bosclient) Put(ctx context.Context, key string, in io.Reader, getters .
 		return err
 	}
 	args := new(api.PutObjectArgs)
-	t := q.GetTier(ctx)
+	t := q.getRuntimeTier(ctx)
 	if t.Sc != "" {
 		args.StorageClass = t.Sc
 	}
@@ -159,7 +162,7 @@ func (q *bosclient) Restore(ctx context.Context, key string, days int32) error {
 }
 
 func (q *bosclient) Copy(ctx context.Context, dst, src string) error {
-	tier := q.GetTier(ctx)
+	tier := q.getRuntimeTier(ctx)
 	sc := getOrDefaultScValue(tier.Sc, api.STORAGE_CLASS_STANDARD)
 	args := &api.CopyObjectArgs{
 		ObjectMeta: api.ObjectMeta{StorageClass: sc},

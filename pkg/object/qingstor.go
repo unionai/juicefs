@@ -111,41 +111,6 @@ func (q *qingstor) Restore(ctx context.Context, key string, days int32) error {
 	return notSupported
 }
 
-func findLen(in io.Reader) (io.Reader, int64, error) {
-	var vlen int64
-	switch v := in.(type) {
-	case *bytes.Buffer:
-		vlen = int64(v.Len())
-	case *bytes.Reader:
-		vlen = int64(v.Len())
-	case *strings.Reader:
-		vlen = int64(v.Len())
-	case *os.File:
-		st, err := v.Stat()
-		if err != nil {
-			return nil, 0, err
-		}
-		vlen = st.Size()
-	case io.ReadSeeker:
-		var err error
-		vlen, err = v.Seek(0, 2)
-		if err != nil {
-			return nil, 0, err
-		}
-		if _, err = v.Seek(0, 0); err != nil {
-			return nil, 0, err
-		}
-	default:
-		d, err := io.ReadAll(in)
-		if err != nil {
-			return nil, 0, err
-		}
-		vlen = int64(len(d))
-		in = bytes.NewBuffer(d)
-	}
-	return in, vlen, nil
-}
-
 func (q *qingstor) Put(ctx context.Context, key string, in io.Reader, getters ...AttrGetter) error {
 	body, vlen, err := findLen(in)
 	if err != nil {
@@ -351,6 +316,7 @@ func newQingStor(endpoint, accessKey, secretKey, token string) (ObjectStorage, e
 	}
 	conf.Host = host
 	conf.Protocol = uri.Scheme
+	conf.AdditionalUserAgent = UserAgent
 	if uri.Scheme == "http" {
 		conf.Port = 80
 	} else {
