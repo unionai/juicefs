@@ -362,6 +362,15 @@ func (store *cachedStore) upload(ctx context.Context, key string, block *Page, s
 		// block will be freed after written into disk
 		store.bcache.cache(key, block, false, false)
 	}
+	// Once uploaded the block is immutable under its key: offer it to the
+	// node-shared read cache too, so the next mount on this node -- of this
+	// volume or a fork sealed from it -- finds the blocks this one rewrote
+	// (for a block volume: the superblock and journal, every session).
+	var forShared *Page
+	if store.shared != nil {
+		block.Acquire()
+		forShared = block
+	}
 	n, err := store.compressor.Compress(buf.Data, block.Data)
 	block.Release()
 	if err != nil {
@@ -386,6 +395,12 @@ func (store *cachedStore) upload(ctx context.Context, key string, block *Page, s
 	}
 	if err != nil && try >= max {
 		err = fmt.Errorf("(max tries) upload block %s: %s (after %d tries)", key, err, try)
+	}
+	if forShared != nil {
+		if err == nil {
+			store.shared.cache(key, forShared, false, !store.conf.OSCache)
+		}
+		forShared.Release()
 	}
 	return err
 }

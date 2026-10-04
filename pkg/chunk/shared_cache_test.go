@@ -130,3 +130,45 @@ func TestSharedReadCacheGetsNoStaging(t *testing.T) {
 		t.Errorf("expected the block staged privately: %v", err)
 	}
 }
+
+// A block this client uploaded reaches the shared cache too, so another client
+// on the node reads it locally even though this one never fetched it.
+func TestSharedReadCacheGetsUploadedBlocks(t *testing.T) {
+	root := t.TempDir()
+	shared := filepath.Join(root, "shared")
+	mem, _ := object.CreateStorage("mem", "", "", "", "")
+	data := bytes.Repeat([]byte("u"), defaultConf.BlockSize)
+	w := NewCachedStore(mem, sharedConf(t, filepath.Join(root, "w"), shared), nil)
+	writer := w.NewWriter(99, 0)
+	if _, err := writer.WriteAt(data, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Finish(len(data)); err != nil {
+		t.Fatal(err)
+	}
+	key := sliceForRead(99, len(data), w.(*cachedStore)).key(0)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		found := false
+		_ = filepath.Walk(shared, func(p string, info os.FileInfo, err error) error {
+			if err == nil && !info.IsDir() && filepath.Base(p) == filepath.Base(key) {
+				found = true
+			}
+			return nil
+		})
+		if found {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("an uploaded block never reached the shared cache")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := mem.Delete(context.Background(), key); err != nil {
+		t.Fatal(err)
+	}
+	r := NewCachedStore(mem, sharedConf(t, filepath.Join(root, "r"), shared), nil)
+	if got := readAll(t, r, 99, len(data)); !bytes.Equal(got, data) {
+		t.Fatal("the uploaded block was not served from the shared cache")
+	}
+}
