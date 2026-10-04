@@ -118,7 +118,12 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 	key := s.key(indx)
 	if s.store.conf.CacheEnabled() {
 		start := time.Now()
-		r, err := s.store.bcache.load(key)
+		bc := s.store.bcache
+		r, err := bc.load(key)
+		if err != nil && s.store.shared != nil {
+			bc = s.store.shared
+			r, err = bc.load(key)
+		}
 		if err == nil {
 			n, err = r.ReadAt(p, int64(boff))
 			if !s.store.conf.OSCache {
@@ -132,7 +137,7 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 				return n, nil
 			}
 			logger.Warnf("remove partial cached block %s: %d %s", key, n, err)
-			s.store.bcache.remove(key, false)
+			bc.remove(key, false)
 		}
 	}
 
@@ -523,9 +528,18 @@ func (s *wSlice) Abort() {
 
 // Config contains options for cachedStore
 type Config struct {
-	CacheDir               string
-	CacheMode              os.FileMode
-	CacheSize              uint64
+	CacheDir  string
+	CacheMode os.FileMode
+	CacheSize uint64
+	// SharedCacheDir is a READ cache shared with other clients on the node
+	// (union fork). Blocks fetched from object storage are kept there instead
+	// of in CacheDir, and a read misses to it before going remote. Blocks are
+	// immutable and keyed by slice id, so sharing them between writers is
+	// safe; writeback staging never goes there. Empty: off.
+	SharedCacheDir  string
+	SharedCacheSize uint64
+	// sharedRead marks the shared read cache's own Config (see diskCache.openWorld).
+	sharedRead             bool
 	CacheItems             int64
 	CacheChecksum          string
 	CacheEviction          string
@@ -582,6 +596,12 @@ func (c *Config) SelfCheck(uuid string) {
 	if c.BufferSize <= 32<<20 {
 		logger.Warnf("buffer-size is too small, setting it to 32 MiB")
 		c.BufferSize = 32 << 20
+	}
+	if c.SharedCacheDir != "" {
+		c.SharedCacheDir = filepath.Join(c.SharedCacheDir, uuid)
+		if c.SharedCacheSize == 0 {
+			c.SharedCacheSize = c.CacheSize
+		}
 	}
 	if c.CacheDir != "memory" {
 		ds := utils.SplitDir(c.CacheDir)
@@ -663,6 +683,7 @@ func (c *Config) CacheEnabled() bool {
 type cachedStore struct {
 	storage         object.ObjectStorage
 	bcache          CacheManager
+	shared          CacheManager // node-shared read cache, or nil (Config.SharedCacheDir)
 	fetcher         *prefetcher
 	conf            Config
 	group           *Controller
@@ -825,7 +846,7 @@ func (store *cachedStore) load(ctx context.Context, key string, page *Page, cach
 		return fmt.Errorf("read %s fully: %v (%d < %d) after %s", key, err, res.n, len(page.Data), used)
 	}
 	if cache {
-		store.bcache.cache(key, page, forceCache, !store.conf.OSCache)
+		store.fillCache(key, page, forceCache, !store.conf.OSCache)
 	}
 	return nil
 }
@@ -879,6 +900,19 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 		}
 	})
 
+	if config.SharedCacheDir != "" && config.CacheEnabled() && config.CacheDir != "memory" {
+		sc := config
+		sc.CacheDir = config.SharedCacheDir
+		sc.CacheSize = config.SharedCacheSize
+		sc.Writeback = false // a read cache: nothing is ever staged here
+		sc.AutoCreate = true
+		sc.sharedRead = true
+		// nil registry: the private cache owns the cache metrics; hits on the
+		// shared one are counted as cache hits by the read path below.
+		store.shared = newCacheManager(&sc, nil, nil)
+		logger.Infof("node-shared read cache at %s (size %d MiB)", sc.CacheDir, sc.CacheSize>>20)
+	}
+
 	if mgr, ok := store.bcache.(*cacheManager); ok {
 		fallbackConfig := config
 		fallbackConfig.CacheSize = 100 << 20
@@ -910,7 +944,7 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 		})
 		defer block.Release()
 		if err == nil && block == p {
-			store.bcache.cache(key, block, true, !store.conf.OSCache)
+			store.fillCache(key, block, true, !store.conf.OSCache)
 		}
 	})
 
@@ -1285,3 +1319,15 @@ func (store *cachedStore) BlobStorage() object.ObjectStorage {
 }
 
 var _ ChunkStore = (*cachedStore)(nil)
+
+// fillCache keeps a block just fetched from object storage: in the node-shared
+// read cache when there is one (so the next client on this node reads it
+// locally), else in this client's own cache. Blocks written here never come
+// through this path; they are staged and cached privately.
+func (store *cachedStore) fillCache(key string, p *Page, force, dropCache bool) {
+	if store.shared != nil {
+		store.shared.cache(key, p, force, dropCache)
+		return
+	}
+	store.bcache.cache(key, p, force, dropCache)
+}
