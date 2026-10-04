@@ -396,7 +396,9 @@ func getChunkConf(c *cli.Context, format *meta.Format) *chunk.Config {
 		UploadHours:            c.String("upload-hours"),
 
 		CacheDir:          c.String("cache-dir"),
+		SharedCacheDir:    c.String("shared-cache-dir"),
 		CacheSize:         utils.ParseBytes(c, "cache-size", 'M'),
+		SharedCacheSize:   sharedCacheSize(c),
 		CacheItems:        c.Int64("cache-items"),
 		FreeSpace:         float32(c.Float64("free-space-ratio")),
 		CacheMode:         os.FileMode(cm),
@@ -698,4 +700,12 @@ func mount(c *cli.Context) error {
 	object.Shutdown(blob)
 	logger.Infof("The juicefs mount process exit successfully, mountpoint: %q", metaConf.MountPoint)
 	return err
+}
+
+// sharedCacheSize is --shared-cache-size, or 0 (= --cache-size) when unset.
+func sharedCacheSize(c *cli.Context) uint64 {
+	if c.String("shared-cache-size") == "" {
+		return 0
+	}
+	return utils.ParseBytes(c, "shared-cache-size", 'M')
 }

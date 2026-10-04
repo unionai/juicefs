@@ -234,6 +234,14 @@ func dataCacheFlags() []cli.Flag {
 			Usage: "directory paths of local cache, use colon to separate multiple paths",
 		},
 		&cli.StringFlag{
+			Name:  "shared-cache-dir",
+			Usage: "a read cache shared with other clients on this node (blocks fetched from object storage are kept there; writeback staging stays in --cache-dir)",
+		},
+		&cli.StringFlag{
+			Name:  "shared-cache-size",
+			Usage: "size of the shared read cache in MiB (default: --cache-size)",
+		},
+		&cli.StringFlag{
 			Name:  "cache-mode",
 			Value: "0600", // only owner can read/write cache
 			Usage: "file permissions for cached blocks",

@@ -74,8 +74,13 @@ type diskCache struct {
 	// container -- and a writer that outran its uploads filled the
 	// container's writable layer past its ephemeral-storage limit.
 	stagedBytes atomic.Int64
-	id          string
-	totalPages  int64
+	// openWorld: other processes add files to this directory (the node-shared
+	// read cache, Config.sharedRead), so a key missing from this process's
+	// index may still be on disk. Lookups try the file instead of trusting
+	// the index, and a hit joins the index so eviction accounts for it.
+	openWorld  bool
+	id         string
+	totalPages int64
 	sync.Mutex
 	dir           string
 	mode          os.FileMode
@@ -140,6 +145,7 @@ func newDiskCache(m *cacheManagerMetrics, dir string, cacheSize, maxItems int64,
 		uploader:            uploader,
 		opTs:                make(map[time.Duration]func() error),
 		stagedBlockCooldown: config.CacheExpire / 2,
+		openWorld:           config.sharedRead,
 	}
 	c.stateLock = sync.Mutex{}
 	if config.Writeback {
@@ -677,7 +683,8 @@ func (cache *diskCache) load(key string) (ReadCloser, error) {
 		return NewPageReader(p), nil
 	}
 	k := cache.getCacheKey(key)
-	if cache.scanned && cache.keys.get(k) == nil {
+	known := cache.keys.get(k) != nil
+	if cache.scanned && !known && !cache.openWorld {
 		return nil, errNotCached
 	}
 	cache.Unlock()
@@ -697,6 +704,11 @@ func (cache *diskCache) load(key string) (ReadCloser, error) {
 		if it := cache.keys.remove(k, false); it != nil {
 			cache.used -= int64(it.size + 4096)
 		}
+	} else if !known && cache.openWorld && cache.keys.get(k) == nil {
+		// Another client on the node cached it; count it from now on.
+		size := parseObjOrigSize(key)
+		cache.keys.add(k, cacheItem{size: int32(size), atime: uint32(time.Now().Unix())})
+		cache.used += int64(size + 4096)
 	}
 	return f, err
 }
@@ -708,7 +720,7 @@ func (cache *diskCache) exist(key string) (bool, error) {
 		return true, nil
 	}
 	k := cache.getCacheKey(key)
-	if cache.scanned && cache.keys.get(k) == nil {
+	if cache.scanned && cache.keys.get(k) == nil && !cache.openWorld {
 		return false, errNotCached
 	}
 	cache.Unlock()
