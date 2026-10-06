@@ -1472,7 +1472,9 @@ func (m *kvMeta) doFallocate(ctx Context, inode Ino, mode uint8, off uint64, siz
 				if coff+size > ChunkSize {
 					l = ChunkSize - coff
 				}
-				tx.append(m.chunkKey(inode, indx), marshalSlice(uint32(coff), 0, 0, 0, uint32(l)))
+				if !isHole(readSliceBuf(tx.get(m.chunkKey(inode, indx))), uint32(coff), uint32(l)) {
+					tx.append(m.chunkKey(inode, indx), marshalSlice(uint32(coff), 0, 0, 0, uint32(l)))
+				}
 				off += l
 				size -= l
 			}

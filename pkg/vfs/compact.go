@@ -18,6 +18,7 @@ package vfs
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/chunk"
@@ -51,6 +52,23 @@ func readSlice(store chunk.ChunkStore, s *meta.Slice, page *chunk.Page, off int)
 	return nil
 }
 
+var (
+	zerosMu sync.Mutex
+	zeros   []byte
+)
+
+// zeroBlock returns a shared all-zero buffer of at least n bytes. Callers
+// only read it (WriteAt copies from it), so one buffer serves every
+// compaction.
+func zeroBlock(n int) []byte {
+	zerosMu.Lock()
+	defer zerosMu.Unlock()
+	if len(zeros) < n {
+		zeros = make([]byte, n)
+	}
+	return zeros[:n]
+}
+
 func Compact(conf chunk.Config, store chunk.ChunkStore, slices []meta.Slice, id uint64, tierID uint8) error {
 	for utils.AllocMemory()-store.UsedMemory() > int64(conf.BufferSize)*3/2 {
 		time.Sleep(time.Millisecond * 100)
@@ -68,12 +86,28 @@ func Compact(conf chunk.Config, store chunk.ChunkStore, slices []meta.Slice, id 
 	var pos int
 	for i, s := range slices {
 		if s.Id == 0 {
-			_, err := writer.WriteAt(make([]byte, int(s.Len)), int64(pos))
-			if err != nil {
-				writer.Abort()
-				return err
+			// A hole (a punched or never-written range): write it a block at a
+			// time from one shared zero buffer and upload each block as it
+			// fills, as the data path below does. Materializing the whole hole
+			// (up to a 64 MiB chunk) and holding every block until Finish cost
+			// ~170 MiB of heap per compaction, and a trimmed block image
+			// compacts hundreds of such chunks, ~10 at a time.
+			zeros := zeroBlock(conf.BlockSize)
+			for left := int(s.Len); left > 0; {
+				l := min(left, len(zeros))
+				if _, err := writer.WriteAt(zeros[:l], int64(pos)); err != nil {
+					writer.Abort()
+					return err
+				}
+				pos += l
+				left -= l
+				if pos >= conf.BlockSize {
+					if err := writer.FlushTo(pos); err != nil {
+						writer.Abort()
+						return err
+					}
+				}
 			}
-			pos += int(s.Len)
 			continue
 		}
 		var read int
