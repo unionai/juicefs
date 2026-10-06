@@ -216,24 +216,37 @@ OUT:
 // (ext4 forgets what it trimmed when it unmounts), so without this check
 // each mount grew every chunk by a record until reads triggered compaction,
 // which rewrites the holes as zero-filled objects.
+//
+// It runs inside the punch's transaction, on chunks that may hold thousands
+// of records, so it walks them newest first and stops as soon as the answer
+// is known (usually at the previous trim's record for the same range),
+// instead of building the chunk's whole slice tree.
 func isHole(ss []*slice, off, l uint32) bool {
 	if ss == nil { // corrupt: punch as before
 		return false
 	}
-	if l == 0 {
-		return true
-	}
-	var pos uint32
-	end := off + l
-	for _, s := range buildSlice(ss) {
-		next := pos + s.Len
-		if next > off && pos < end && s.Id != 0 {
-			return false
+	// The parts of the range no newer record has covered yet.
+	open := [][2]uint32{{off, off + l}}
+	for i := len(ss) - 1; i >= 0 && len(open) > 0; i-- {
+		s := ss[i]
+		lo, hi := s.pos, s.pos+s.len
+		next := open[:0:0]
+		for _, r := range open {
+			if hi <= r[0] || lo >= r[1] {
+				next = append(next, r)
+				continue
+			}
+			if s.id != 0 {
+				return false // the newest record over these bytes is data
+			}
+			if r[0] < lo {
+				next = append(next, [2]uint32{r[0], lo})
+			}
+			if hi < r[1] {
+				next = append(next, [2]uint32{hi, r[1]})
+			}
 		}
-		if next >= end {
-			return true
-		}
-		pos = next
+		open = next
 	}
-	return true
+	return true // what is left was never written: it reads as zeros
 }
