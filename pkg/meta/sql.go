@@ -1749,9 +1749,13 @@ func (m *dbMeta) doFallocate(ctx Context, inode Ino, mode uint8, off uint64, siz
 				if coff+size > ChunkSize {
 					l = ChunkSize - coff
 				}
-				err = m.appendSlice(s, inode, indx, marshalSlice(uint32(coff), 0, 0, 0, uint32(l)))
-				if err != nil {
+				c := chunk{Inode: inode, Indx: indx}
+				if ok, err := s.Get(&c); err != nil {
 					return err
+				} else if !ok || !isHole(readSliceBuf(c.Slices), uint32(coff), uint32(l)) {
+					if err = m.appendSlice(s, inode, indx, marshalSlice(uint32(coff), 0, 0, 0, uint32(l))); err != nil {
+						return err
+					}
 				}
 				off += l
 				size -= l

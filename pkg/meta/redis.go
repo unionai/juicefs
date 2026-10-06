@@ -1426,7 +1426,13 @@ func (m *redisMeta) doFallocate(ctx Context, inode Ino, mode uint8, off uint64, 
 					if coff+size > ChunkSize {
 						l = ChunkSize - coff
 					}
-					pipe.RPush(ctx, m.chunkKey(inode, indx), marshalSlice(uint32(coff), 0, 0, 0, uint32(l)))
+					vals, err := tx.LRange(ctx, m.chunkKey(inode, indx), 0, -1).Result()
+					if err != nil {
+						return err
+					}
+					if !isHole(readSlices(vals), uint32(coff), uint32(l)) {
+						pipe.RPush(ctx, m.chunkKey(inode, indx), marshalSlice(uint32(coff), 0, 0, 0, uint32(l)))
+					}
 					off += l
 					size -= l
 				}

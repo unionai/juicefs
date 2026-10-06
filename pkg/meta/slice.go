@@ -208,3 +208,32 @@ OUT:
 	}
 	return skipped
 }
+
+// isHole reports whether [off, off+l) of a chunk already reads as zeros: it is
+// covered only by holes (slices with id 0) or lies past the chunk's last
+// slice. Punching such a range again changes nothing but adds a slice record,
+// and an fstrim of a block image re-punches every free range on every mount
+// (ext4 forgets what it trimmed when it unmounts), so without this check
+// each mount grew every chunk by a record until reads triggered compaction,
+// which rewrites the holes as zero-filled objects.
+func isHole(ss []*slice, off, l uint32) bool {
+	if ss == nil { // corrupt: punch as before
+		return false
+	}
+	if l == 0 {
+		return true
+	}
+	var pos uint32
+	end := off + l
+	for _, s := range buildSlice(ss) {
+		next := pos + s.Len
+		if next > off && pos < end && s.Id != 0 {
+			return false
+		}
+		if next >= end {
+			return true
+		}
+		pos = next
+	}
+	return true
+}

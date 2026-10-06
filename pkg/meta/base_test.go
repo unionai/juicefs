@@ -184,6 +184,7 @@ func testMeta(t *testing.T, m Meta) {
 	testCompaction(t, m, false)
 	time.Sleep(time.Second)
 	testCompaction(t, m, true)
+	testRepeatedPunchHole(t, m)
 	testCopyFileRange(t, m)
 	testCloseSession(t, m)
 	testConcurrentDir(t, m)
@@ -1928,8 +1929,10 @@ func testCompaction(t *testing.T, m Meta, trash bool) {
 	if st := m.Read(ctx, inode, 2, &slices); st != 0 {
 		t.Fatalf("read 1: %s", st)
 	}
-	// compact twice: 4515328+2607724-2338508 = 4784544; 8829056+1074933-2338508-4784544=2780937
-	if len(slices) != 3 || slices[0].Len != 2338508 || slices[1].Len != 4784544 || slices[2].Len != 2780937 {
+	// The second zero range lies inside the first, already a hole, so it adds
+	// no record (isHole). Compacted: 4515328-2338508 = 2176820 up to the zero
+	// range; 8829056+1074933-4515328 = 5388661 from it to the end.
+	if len(slices) != 3 || slices[0].Len != 2338508 || slices[1].Len != 2176820 || slices[2].Len != 5388661 {
 		t.Fatalf("inode %d should be compacted, but have %d slices, size %d,%d,%d",
 			inode, len(slices), slices[0].Len, slices[1].Len, slices[2].Len)
 	}
@@ -6127,5 +6130,60 @@ func testBatchUnlinkWithUserGroupQuota(t *testing.T, m Meta, ctx Context, parent
 	}
 	if err := m.HandleQuota(ctx, QuotaDel, fmt.Sprintf("%d", gid), GroupQuotaType, nil, false, false, false); err != nil {
 		t.Fatalf("Delete group quota: %s", err)
+	}
+}
+
+// fstrim of a block image re-punches every free range on every mount. A range
+// that is already a hole must not grow the chunk by another slice record.
+func testRepeatedPunchHole(t *testing.T, m Meta) {
+	ctx := Background()
+	var inode Ino
+	attr := &Attr{}
+	if st := m.Create(ctx, 1, "punch-repeat", 0644, 022, 0, &inode, attr); st != 0 {
+		t.Fatalf("create: %s", st)
+	}
+	defer m.Unlink(ctx, 1, "punch-repeat")
+	var sliceId uint64
+	if st := m.NewSlice(ctx, &sliceId); st != 0 {
+		t.Fatalf("new slice: %s", st)
+	}
+	if st := m.Write(ctx, inode, 0, 0, Slice{Id: sliceId, Size: 4 << 20, Len: 4 << 20}, time.Now()); st != 0 {
+		t.Fatalf("write: %s", st)
+	}
+	raw := func() int {
+		ss, st := m.getBase().en.doRead(ctx, inode, 0)
+		if st != 0 {
+			t.Fatalf("read: %s", st)
+		}
+		return len(ss)
+	}
+	punch := func(off, size uint64) {
+		if st := m.Fallocate(ctx, inode, fallocPunchHole|fallocKeepSize, off, size, nil); st != 0 {
+			t.Fatalf("punch %d+%d: %s", off, size, st)
+		}
+	}
+	punch(1<<20, 1<<20)
+	if n := raw(); n != 2 {
+		t.Fatalf("first punch: %d records, want 2", n)
+	}
+	punch(1<<20, 1<<20)        // the same hole again
+	punch(1<<20+4096, 512<<10) // inside it
+	if n := raw(); n != 2 {
+		t.Fatalf("re-punching a hole added records: %d, want 2", n)
+	}
+	punch(512<<10, 1<<20) // overlaps data: a new record
+	if n := raw(); n != 3 {
+		t.Fatalf("punch over data: %d records, want 3", n)
+	}
+	var slices []Slice
+	if st := m.Read(ctx, inode, 0, &slices); st != 0 {
+		t.Fatalf("read: %s", st)
+	}
+	var pos uint32
+	for _, s := range slices {
+		if hole := pos >= 512<<10 && pos+s.Len <= 2<<20; hole != (s.Id == 0) && s.Len > 0 {
+			t.Fatalf("visible layout wrong at %d: %+v (all: %+v)", pos, s, slices)
+		}
+		pos += s.Len
 	}
 }
