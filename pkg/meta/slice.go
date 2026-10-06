@@ -208,3 +208,45 @@ OUT:
 	}
 	return skipped
 }
+
+// isHole reports whether [off, off+l) of a chunk already reads as zeros: it is
+// covered only by holes (slices with id 0) or lies past the chunk's last
+// slice. Punching such a range again changes nothing but adds a slice record,
+// and an fstrim of a block image re-punches every free range on every mount
+// (ext4 forgets what it trimmed when it unmounts), so without this check
+// each mount grew every chunk by a record until reads triggered compaction,
+// which rewrites the holes as zero-filled objects.
+//
+// It runs inside the punch's transaction, on chunks that may hold thousands
+// of records, so it walks them newest first and stops as soon as the answer
+// is known (usually at the previous trim's record for the same range),
+// instead of building the chunk's whole slice tree.
+func isHole(ss []*slice, off, l uint32) bool {
+	if ss == nil { // corrupt: punch as before
+		return false
+	}
+	// The parts of the range no newer record has covered yet.
+	open := [][2]uint32{{off, off + l}}
+	for i := len(ss) - 1; i >= 0 && len(open) > 0; i-- {
+		s := ss[i]
+		lo, hi := s.pos, s.pos+s.len
+		next := open[:0:0]
+		for _, r := range open {
+			if hi <= r[0] || lo >= r[1] {
+				next = append(next, r)
+				continue
+			}
+			if s.id != 0 {
+				return false // the newest record over these bytes is data
+			}
+			if r[0] < lo {
+				next = append(next, [2]uint32{r[0], lo})
+			}
+			if hi < r[1] {
+				next = append(next, [2]uint32{hi, r[1]})
+			}
+		}
+		open = next
+	}
+	return true // what is left was never written: it reads as zeros
+}
