@@ -4,7 +4,9 @@ import (
 	"os"
 	"path"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 
 	billy "github.com/go-git/go-billy/v5"
 
@@ -28,9 +30,37 @@ type Filesystem struct {
 	ctx  meta.Context
 	open *openFiles
 
+	// readdirInos carries the inode of each entry a ReadDir just returned,
+	// for the ToHandle calls that immediately follow it.
+	//
+	// READDIRPLUS mints a handle per entry, and ToHandle only receives a path,
+	// so without this each of them re-resolves a name whose inode we were
+	// holding moments earlier. pkg/fs.Readdir builds its own private dircache
+	// and does not populate the fs.entries/fs.attrs caches that Lstat reads,
+	// so those lookups really do reach the metadata engine: profiling a
+	// 512-entry READDIRPLUS put the time in meta.(*memTxn).get.
+	//
+	// Entries are consumed on read, so an inode learned here is used once, by
+	// the ToHandle for the very next entry, and a rename between the two
+	// cannot be served a stale mapping twice. The TTL bounds anything that
+	// goes unclaimed because the client stopped reading mid-directory.
+	readdirInos   map[string]readdirIno
+	readdirInosMu sync.Mutex
+	readdirHits   uint64
+	readdirMiss   uint64
+
 	readOnly bool
 	umask    uint16
 }
+
+type readdirIno struct {
+	ino    meta.Ino
+	expire time.Time
+}
+
+// readdirInoTTL only has to span the gap between a ReadDir and the ToHandle
+// calls for its entries, which is the same RPC.
+const readdirInoTTL = 5 * time.Second
 
 var _ billy.Filesystem = (*Filesystem)(nil)
 
@@ -39,7 +69,14 @@ var _ billy.Filesystem = (*Filesystem)(nil)
 // server listens only on loopback and a local client's claimed uid is not a
 // thing we can verify. One identity for the whole mount is the honest model.
 func NewFilesystem(f *fs.FileSystem, ctx meta.Context, readOnly bool) *Filesystem {
-	return &Filesystem{fs: f, ctx: ctx, open: newOpenFiles(), readOnly: readOnly, umask: 0022}
+	return &Filesystem{
+		fs:          f,
+		ctx:         ctx,
+		open:        newOpenFiles(),
+		readdirInos: make(map[string]readdirIno),
+		readOnly:    readOnly,
+		umask:       0022,
+	}
 }
 
 // Close releases the shared handles. Dirty data is flushed by the Close of each
@@ -51,6 +88,15 @@ func (n *Filesystem) Close() { n.open.close() }
 // one that has silently fallen back to go-nfs's per-RPC open or to reverse
 // path resolution.
 func (n *Filesystem) Stats() (opened, reused uint64) { return n.open.stats() }
+
+// ReaddirHintStats reports whether the readdir inode hint is actually being
+// consumed by the ToHandle calls that follow a listing.
+func (n *Filesystem) ReaddirHintStats() (hits, misses uint64) {
+	n.readdirInosMu.Lock()
+	defer n.readdirInosMu.Unlock()
+
+	return n.readdirHits, n.readdirMiss
+}
 
 func (n *Filesystem) Join(elem ...string) string { return path.Join(elem...) }
 
@@ -88,12 +134,50 @@ func (n *Filesystem) Lstat(name string) (os.FileInfo, error) {
 // inodeOf is how a path becomes a handle. It rides pkg/fs's attribute cache, so
 // a repeat on a hot path is not a metadata round trip.
 func (n *Filesystem) inodeOf(name string) (meta.Ino, error) {
-	fi, eno := n.fs.Lstat(n.ctx, clean(name))
+	p := clean(name)
+	if ino, ok := n.takeReaddirIno(p); ok {
+		return ino, nil
+	}
+	fi, eno := n.fs.Lstat(n.ctx, p)
 	if eno != 0 {
 		return 0, econv(eno)
 	}
 
 	return fi.Inode(), nil
+}
+
+func (n *Filesystem) putReaddirIno(p string, ino meta.Ino) {
+	n.readdirInosMu.Lock()
+	defer n.readdirInosMu.Unlock()
+	now := time.Now()
+	// Sweep here rather than on a timer: the map only ever grows by the size
+	// of a directory listing, and this runs once per entry of the next one.
+	if len(n.readdirInos) > 4096 {
+		for k, v := range n.readdirInos {
+			if now.After(v.expire) {
+				delete(n.readdirInos, k)
+			}
+		}
+	}
+	n.readdirInos[p] = readdirIno{ino: ino, expire: now.Add(readdirInoTTL)}
+}
+
+func (n *Filesystem) takeReaddirIno(p string) (meta.Ino, bool) {
+	n.readdirInosMu.Lock()
+	defer n.readdirInosMu.Unlock()
+	v, ok := n.readdirInos[p]
+	if !ok {
+		n.readdirMiss++
+
+		return 0, false
+	}
+	n.readdirHits++
+	delete(n.readdirInos, p)
+	if time.Now().After(v.expire) {
+		return 0, false
+	}
+
+	return v.ino, true
 }
 
 func (n *Filesystem) Open(name string) (billy.File, error) {
@@ -176,12 +260,17 @@ func (n *Filesystem) ReadDir(name string) ([]os.FileInfo, error) {
 		return nil, econv(eno)
 	}
 
-	// go-nfs expects "." and ".." gone; it synthesises them itself in READDIR
-	// and handles them specially in LOOKUP.
+	// go-nfs expects "." and ".." gone; pkg/fs.Readdir already drops them, and
+	// go-nfs synthesises its own in READDIR and special-cases them in LOOKUP.
+	dir := clean(name)
 	out := make([]os.FileInfo, 0, len(fis))
 	for _, fi := range fis {
-		if nm := fi.Name(); nm == "." || nm == ".." {
+		nm := fi.Name()
+		if nm == "." || nm == ".." {
 			continue
+		}
+		if st, ok := fi.(*fs.FileStat); ok {
+			n.putReaddirIno(path.Join(dir, nm), st.Inode())
 		}
 		out = append(out, fi)
 	}

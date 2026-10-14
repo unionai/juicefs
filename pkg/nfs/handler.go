@@ -2,6 +2,9 @@ package nfs
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	iofs "io/fs"
 	"net"
 	"os"
 	"strings"
@@ -9,6 +12,7 @@ import (
 	"time"
 
 	billy "github.com/go-git/go-billy/v5"
+	lru "github.com/hashicorp/golang-lru/v2"
 	nfs "github.com/willscott/go-nfs"
 
 	"github.com/juicedata/juicefs/pkg/meta"
@@ -33,9 +37,10 @@ const pathCacheSize = 1 << 16
 //     walks every key in its LRU on a miss.
 //   - Eviction costs one reverse resolution instead of breaking the handle.
 type Handler struct {
-	fs    *Filesystem
-	paths *pathCache
-	meta  meta.Meta
+	fs        *Filesystem
+	paths     *pathCache
+	verifiers *lru.Cache[uint64, dirListing]
+	meta      meta.Meta
 
 	readOnly bool
 }
@@ -47,8 +52,12 @@ func NewHandler(f *Filesystem, m meta.Meta, readOnly bool) (*Handler, error) {
 	if err != nil {
 		return nil, err
 	}
+	vc, err := lru.New[uint64, dirListing](verifierCacheSize)
+	if err != nil {
+		return nil, err
+	}
 
-	return &Handler{fs: f, paths: pc, meta: m, readOnly: readOnly}, nil
+	return &Handler{fs: f, paths: pc, verifiers: vc, meta: m, readOnly: readOnly}, nil
 }
 
 // Stats reports handle-cache effectiveness alongside the open-handle counters.
@@ -249,4 +258,70 @@ func (n *Filesystem) Chtimes(name string, atime, mtime time.Time) error {
 	return econv(f.Utime2(n.ctx,
 		atime.Unix(), int64(atime.Nanosecond()),
 		mtime.Unix(), int64(mtime.Nanosecond())))
+}
+
+// VerifierFor and DataForVerifier implement nfs.CachingHandler, which go-nfs
+// consults optionally — and not implementing it is expensive in a way that is
+// easy to miss.
+//
+// A client reads a large directory in several READDIRPLUS calls, because each
+// reply is bounded by the request's DirCount and MaxCount. go-nfs's
+// getDirListingWithVerifier serves each of those calls by calling
+// fs.ReadDir(path) afresh, sorting the result, and then — to produce the cookie
+// verifier — SHA-256-ing the path and every entry's name and attributes. So a
+// 512-entry directory read in ~64-entry pages does all of that eight times
+// over, and the cost is in the re-listing and re-hashing, not in the entries
+// actually returned.
+//
+// Caching the listing under its verifier makes the first page pay for the
+// listing and the rest hit this. The NFSv3 cookie verifier is designed for
+// exactly this: if a client comes back with one we no longer hold, go-nfs
+// answers NFSStatusBadCookie and the client restarts the listing, so a miss
+// costs a re-read rather than a wrong answer.
+//
+// Measured on a 512-entry directory, before and after: see the package
+// benchmarks (BenchmarkMetadata/readdir512).
+
+// verifierCacheSize is in directories, not entries. Enough to cover the
+// listings in flight across a few concurrent readers.
+const verifierCacheSize = 128
+
+type dirListing struct {
+	path     string
+	contents []iofs.FileInfo
+}
+
+func (h *Handler) VerifierFor(path string, contents []iofs.FileInfo) uint64 {
+	id := hashListing(path, contents)
+	h.verifiers.Add(id, dirListing{path: path, contents: contents})
+
+	return id
+}
+
+func (h *Handler) DataForVerifier(path string, id uint64) []iofs.FileInfo {
+	if v, ok := h.verifiers.Get(id); ok && v.path == path {
+		return v.contents
+	}
+
+	return nil
+}
+
+// hashListing must agree with nothing in particular — go-nfs uses whatever we
+// return as the opaque verifier — but it does have to change when the directory
+// changes, or a client would page through a listing that has since been
+// replaced. Name and size and mtime per entry is enough for that.
+func hashListing(path string, contents []iofs.FileInfo) uint64 {
+	d := sha256.New()
+	d.Write([]byte(path))
+	var num [8]byte
+	for _, c := range contents {
+		d.Write([]byte(c.Name()))
+		binary.BigEndian.PutUint64(num[:], uint64(c.Size()))
+		d.Write(num[:])
+		binary.BigEndian.PutUint64(num[:], uint64(c.ModTime().UnixNano()))
+		d.Write(num[:])
+	}
+	sum := d.Sum(nil)
+
+	return binary.BigEndian.Uint64(sum[:8])
 }

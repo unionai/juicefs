@@ -177,7 +177,26 @@ jobs:
           # A real read/write round trip through the kernel's NFS client,
           # large enough to span many RPCs at wsize=1M.
           dd if=/dev/urandom of="$work/src.bin" bs=1m count=64
+
+          # Timed, because this is the only honest throughput number in the
+          # project: the package benchmarks talk to go-nfs-client, which issues
+          # 8 KiB reads whatever the server offers, so their absolute MB/s says
+          # nothing about a real mount. Compared against the same copy to local
+          # disk on the same runner, which is the ceiling.
+          t0=$(date +%s)
           cp "$work/src.bin" "$mnt/data.bin"
+          sync || true
+          t1=$(date +%s)
+          cp "$work/src.bin" "$work/local.bin"
+          t2=$(date +%s)
+          nfs_w=$(( t1 - t0 )); loc_w=$(( t2 - t1 ))
+          echo "write 64MiB: nfs ${nfs_w}s, local ${loc_w}s"
+
+          t0=$(date +%s)
+          cat "$mnt/data.bin" > /dev/null
+          t1=$(date +%s)
+          echo "read 64MiB back over nfs: $(( t1 - t0 ))s"
+
           cmp "$work/src.bin" "$mnt/data.bin"
 
           # Metadata operations, and read back what another process wrote.
