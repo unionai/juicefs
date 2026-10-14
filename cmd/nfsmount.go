@@ -23,10 +23,10 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"os/signal"
 	"path"
 	"runtime"
-	"syscall"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/urfave/cli/v2"
@@ -121,39 +121,51 @@ func nfsmount(c *cli.Context) error {
 	port := srv.Port()
 	logger.Infof("NFS server listening on 127.0.0.1:%d", port)
 
+	mounted := false
+	var closing atomic.Bool
+	var once sync.Once
+	// Unmount first, then close the server: the kernel client must stop sending
+	// RPCs before the handles it is talking to go away. srv.Close is what
+	// flushes the pooled handles, so skipping it loses the tail of a write.
+	reportAndClose := func() {
+		once.Do(func() {
+			closing.Store(true)
+			if mounted {
+				if err := runUnmount(mountPoint); err != nil {
+					logger.Warnf("unmount %s: %s", mountPoint, err)
+				}
+			}
+			opened, reused, hits, misses := srv.Stats()
+			logger.Infof("handles: %d opened, %d reused; path cache: %d hits, %d misses",
+				opened, reused, hits, misses)
+			_ = srv.Close()
+		})
+	}
+	onSvcShutdown(reportAndClose)
+
 	if c.Bool("serve-only") {
 		fmt.Printf("%d\n", port)
 	} else {
 		if err := runMount(mountPoint, port, c.Int("attr-timeout-ms"), readOnly); err != nil {
-			_ = srv.Close()
+			reportAndClose()
 			logger.Fatalf("mount %s: %s", mountPoint, err)
 		}
+		mounted = true
 		logger.Infof("mounted at %s", mountPoint)
-		defer func() {
-			if err := runUnmount(mountPoint); err != nil {
-				logger.Warnf("unmount %s: %s", mountPoint, err)
-			}
-		}()
 	}
 
-	// Unmount and flush on signal. Without this the pooled handles are never
-	// closed, and their Close is what flushes — so the tail of a write would be
-	// lost on Ctrl-C.
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	select {
-	case s := <-sig:
-		logger.Infof("received %s, shutting down", s)
-	case err := <-serveErr:
-		if err != nil {
-			logger.Errorf("NFS server stopped: %s", err)
-		}
+	// Block until the server stops. Signals are NOT handled here: initForSvc
+	// has already installed a SIGINT/SIGTERM handler that exits via os.Exit,
+	// so a second handler would race it and lose, and a deferred unmount would
+	// never run at all — os.Exit skips defers. Teardown is registered with that
+	// handler instead.
+	if err := <-serveErr; err != nil && !closing.Load() {
+		// Closing the listener makes Serve return "use of closed network
+		// connection". That is the shutdown working, not a fault, and logging
+		// it at ERROR would train people to ignore the line that matters.
+		logger.Errorf("NFS server stopped: %s", err)
 	}
-
-	opened, reused, hits, misses := srv.Stats()
-	logger.Infof("handles: %d opened, %d reused; path cache: %d hits, %d misses", opened, reused, hits, misses)
-
-	_ = srv.Close()
+	reportAndClose()
 
 	return jfs.Meta().CloseSession()
 }
