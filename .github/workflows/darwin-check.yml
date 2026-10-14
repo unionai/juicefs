@@ -1,0 +1,129 @@
+# Builds the fork for macOS and proves the binary works, WITHOUT publishing
+# anything. Deliberately separate from union-release.yml: darwin assets are not
+# shipped until a volume can actually be mounted on a Mac, and that needs the
+# NFS server (see below). This job is the gate that tells us the fork compiles
+# and runs there at all.
+#
+# Why a native runner and not a cross-compile from Linux, as elsewhere: the
+# build needs CGO_ENABLED=1 and it is not optional. `gspt` is behind a `nogspt`
+# tag, but `DataDog/zstd` and `hungys/go-lz4` are imported unconditionally by
+# pkg/compress, cmd/dump and cmd/load, so there is no pure-Go build to
+# cross-compile. A cgo cross-compile to darwin would need the macOS SDK.
+# GitHub's macOS runners are free for public repos, which this fork is.
+#
+# Why there is no mount test here yet: mounting on macOS needs macFUSE, a kext
+# whose load requires an interactive approval a hosted runner cannot give. So
+# FUSE can never be exercised in this CI. That is not only a CI limitation —
+# it is the reason Union Volumes need an NFS-server mount path on macOS. Once
+# `juicefs nfs` exists, a real format/mount/read/write/unmount test lands here
+# and needs no kext.
+name: darwin check
+
+on:
+  push:
+    branches:
+      - "haytham/darwin-build"
+  pull_request:
+    paths:
+      - "**.go"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/darwin-check.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Must stay identical to union-release.yml. A darwin-only tag list would
+  # create a platform capability split, which is the class of bug that put us
+  # here: with no fork asset for a platform, bundle_juicefs.py silently falls
+  # back to upstream juicefs, which has no badger — the flyteplugins-union
+  # default metadata store.
+  UNION_BUILD_TAGS: nogateway,nowebdav,nocos,nobos,nohdfs,noibmcos,noobs,nooss,noqingstor,nosftp,noswift,noufile,nob2,nonfs,nodragonfly,nomysql,nopg,notikv,noetcd,nocifs,nostorj,noqiniu,notos,noks3
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: darwin-arm64
+            runner: macos-15
+            arch_match: arm64
+          - platform: darwin-amd64
+            runner: macos-15-intel
+            arch_match: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          set -euxo pipefail
+          go version
+          go build \
+            -tags "$UNION_BUILD_TAGS" \
+            -ldflags "-s -w \
+              -X github.com/juicedata/juicefs/pkg/version.revision=$(git rev-parse --short HEAD) \
+              -X github.com/juicedata/juicefs/pkg/version.revisionDate=$(git log -1 --pretty=format:%cd --date=short)" \
+            -o juicefs .
+
+      - name: Verify the binary is what we think it is
+        run: |
+          set -euo pipefail
+          # NOTE: never `producer | grep -q` under `set -o pipefail`. grep -q
+          # exits at the first match, the producer dies on EPIPE, and pipefail
+          # reports that 141 as the pipeline's status — so the check fails
+          # precisely *because* it matched. Capture first, then match.
+          info=$(file juicefs)
+          echo "$info"
+          echo "$info" | grep "Mach-O" > /dev/null
+          echo "$info" | grep "${{ matrix.arch_match }}" > /dev/null
+
+          ver=$(./juicefs version)
+          echo "$ver"
+          echo "$ver" | grep "$(git rev-parse --short HEAD)" > /dev/null
+
+          # Union-only surface: absent means the wrong branch got built.
+          mount_help=$(./juicefs mount --help 2>&1)
+          echo "$mount_help" | grep -- "--slice-domain" > /dev/null
+          ./juicefs checkpoint --help > /dev/null 2>&1
+
+          # badger is flyteplugins-union's default metadata store and exists
+          # only in this fork.
+          strings juicefs > /tmp/juicefs.strings
+          grep "dgraph-io/badger" /tmp/juicefs.strings > /dev/null
+
+          echo "verified: a union ${{ matrix.platform }} build with badger"
+
+      - name: Format and inspect a badger volume on local disk
+        run: |
+          set -euxo pipefail
+          # No mount — that needs macFUSE (see the header). This still exercises
+          # the whole metadata path on darwin: badger engine open, format write,
+          # and read back. A build that dropped badger, or a badger that cannot
+          # open on darwin, fails right here instead of on a user's Mac.
+          work="$(mktemp -d)"
+          ./juicefs format \
+            --storage file \
+            --bucket "$work/chunks/" \
+            "badger://$work/meta" \
+            darwin-ci-volume
+          ./juicefs status "badger://$work/meta"
+          ./juicefs config "badger://$work/meta"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: juicefs-${{ matrix.platform }}
+          path: juicefs
+          retention-days: 7
