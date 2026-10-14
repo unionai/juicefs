@@ -11,18 +11,19 @@
 # cross-compile. A cgo cross-compile to darwin would need the macOS SDK.
 # GitHub's macOS runners are free for public repos, which this fork is.
 #
-# Why there is no mount test here yet: mounting on macOS needs macFUSE, a kext
-# whose load requires an interactive approval a hosted runner cannot give. So
-# FUSE can never be exercised in this CI. That is not only a CI limitation —
-# it is the reason Union Volumes need an NFS-server mount path on macOS. Once
-# `juicefs nfs` exists, a real format/mount/read/write/unmount test lands here
-# and needs no kext.
+# There is no FUSE mount test and there cannot be one: mounting that way on
+# macOS needs macFUSE, a kext whose load requires an interactive approval a
+# hosted runner cannot give. That is not only a CI limitation — it is the reason
+# Union Volumes need an NFS-server mount path on macOS at all. The NFS mount
+# below IS tested, through the kernel's own client, because mount_nfs against
+# loopback needs neither a kext nor root.
 name: darwin check
 
 on:
   push:
     branches:
       - "haytham/darwin-build"
+      - "haytham/nfs-server"
   pull_request:
     paths:
       - "**.go"
@@ -121,6 +122,74 @@ jobs:
             darwin-ci-volume
           ./juicefs status "badger://$work/meta"
           ./juicefs config "badger://$work/meta"
+
+      - name: Mount over NFS and read and write it, no FUSE and no kext
+        run: |
+          set -euxo pipefail
+          work="$(mktemp -d)"
+          ./juicefs format \
+            --storage file \
+            --bucket "$work/chunks/" \
+            "badger://$work/meta" \
+            nfs-ci-volume
+
+          mkdir -p "$work/mnt"
+          ./juicefs nfsmount --no-usage-report "badger://$work/meta" "$work/mnt" \
+            > "$work/nfs.log" 2>&1 &
+          srv=$!
+
+          # mount_nfs returns before the mount is necessarily visible, and a
+          # fixed sleep here would be a flake either way it was wrong.
+          for i in $(seq 1 60); do
+            if mount | grep -q " on $work/mnt "; then break; fi
+            if ! kill -0 "$srv" 2>/dev/null; then
+              echo "::error::the server exited before the mount appeared"
+              cat "$work/nfs.log"
+              exit 1
+            fi
+            sleep 1
+          done
+
+          mnt_line=$(mount | grep " on $work/mnt " || true)
+          if [ -z "$mnt_line" ]; then
+            echo "::error::no mount at $work/mnt after 60s"
+            cat "$work/nfs.log"
+            exit 1
+          fi
+          echo "$mnt_line"
+          # Assert it really is NFS. If this ever says macfuse, the test has
+          # stopped proving the thing it exists to prove.
+          echo "$mnt_line" | grep -i nfs > /dev/null
+
+          # A real read/write round trip through the kernel's NFS client,
+          # large enough to span many RPCs at wsize=1M.
+          dd if=/dev/urandom of="$work/src.bin" bs=1m count=64
+          cp "$work/src.bin" "$work/mnt/data.bin"
+          cmp "$work/src.bin" "$work/mnt/data.bin"
+
+          # Metadata operations, and read back what another process wrote.
+          mkdir "$work/mnt/dir"
+          echo "written through the kernel NFS client" > "$work/mnt/dir/note"
+          ls -la "$work/mnt" "$work/mnt/dir"
+          grep -q "kernel NFS client" "$work/mnt/dir/note"
+          rm "$work/mnt/dir/note"
+          test ! -e "$work/mnt/dir/note"
+
+          # Shut down through the signal path, which is what unmounts and
+          # flushes; then prove the mount is gone.
+          kill -TERM "$srv"
+          for i in $(seq 1 30); do
+            if ! mount | grep -q " on $work/mnt "; then break; fi
+            sleep 1
+          done
+          if mount | grep -q " on $work/mnt "; then
+            echo "::error::still mounted after SIGTERM"
+            exit 1
+          fi
+          cat "$work/nfs.log"
+          # The handle pool is the whole performance argument; assert it worked
+          # rather than trusting that the transfer completing means it did.
+          grep -E "handles: [0-9]+ opened, [0-9]+ reused" "$work/nfs.log"
 
       - uses: actions/upload-artifact@v4
         with:
