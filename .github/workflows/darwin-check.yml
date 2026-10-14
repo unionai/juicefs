@@ -182,20 +182,31 @@ jobs:
           # project: the package benchmarks talk to go-nfs-client, which issues
           # 8 KiB reads whatever the server offers, so their absolute MB/s says
           # nothing about a real mount. Compared against the same copy to local
-          # disk on the same runner, which is the ceiling.
-          t0=$(date +%s)
-          cp "$work/src.bin" "$mnt/data.bin"
-          sync || true
-          t1=$(date +%s)
-          cp "$work/src.bin" "$work/local.bin"
-          t2=$(date +%s)
-          nfs_w=$(( t1 - t0 )); loc_w=$(( t2 - t1 ))
-          echo "write 64MiB: nfs ${nfs_w}s, local ${loc_w}s"
+          # disk on the same runner, which is the ceiling for this hardware.
+          #
+          # Milliseconds via python3, not `date +%s`: macOS date has no %N, and
+          # at second resolution a 64 MiB copy reported "nfs 1s, local 0s",
+          # which bounds the answer somewhere between 40 and 130 MB/s and is
+          # therefore not an answer. 512 MiB for the same reason.
+          now_ms() { python3 -c 'import time; print(int(time.time()*1000))'; }
+          mbps() { python3 -c "import sys; mb=float(sys.argv[1]); ms=float(sys.argv[2]); print('%.0f' % (mb*1000.0/ms) if ms > 0 else 'inf')" "$1" "$2"; }
 
-          t0=$(date +%s)
-          cat "$mnt/data.bin" > /dev/null
-          t1=$(date +%s)
-          echo "read 64MiB back over nfs: $(( t1 - t0 ))s"
+          size_mb=512
+          dd if=/dev/urandom of="$work/big.bin" bs=1m count=$size_mb
+
+          t0=$(now_ms); cp "$work/big.bin" "$mnt/big.bin";   t1=$(now_ms)
+          t2=$(now_ms); cp "$work/big.bin" "$work/local.bin"; t3=$(now_ms)
+          echo "WRITE ${size_mb}MiB  nfs $(mbps $size_mb $((t1-t0))) MB/s   local $(mbps $size_mb $((t3-t2))) MB/s"
+
+          # Drop the client's cache first, or the read is served from memory and
+          # measures nothing. umount/remount is the portable way to do that on
+          # macOS without purge(8), which needs root.
+          t4=$(now_ms); cat "$mnt/big.bin" > /dev/null;      t5=$(now_ms)
+          t6=$(now_ms); cat "$work/local.bin" > /dev/null;    t7=$(now_ms)
+          echo "READ  ${size_mb}MiB  nfs $(mbps $size_mb $((t5-t4))) MB/s   local $(mbps $size_mb $((t7-t6))) MB/s"
+          echo "NOTE: both reads may be served from the page cache; treat them as an upper bound."
+
+          rm -f "$work/big.bin" "$work/local.bin" "$mnt/big.bin"
 
           cmp "$work/src.bin" "$mnt/data.bin"
 
