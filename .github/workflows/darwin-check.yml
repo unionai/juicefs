@@ -134,14 +134,26 @@ jobs:
             nfs-ci-volume
 
           mkdir -p "$work/mnt"
-          ./juicefs nfsmount --no-usage-report "badger://$work/meta" "$work/mnt" \
+          # Resolve the mount point to its physical path BEFORE mounting. On
+          # macOS /var is a symlink to /private/var, so mktemp -d hands back
+          # /var/folders/... while `mount` reports /private/var/folders/... —
+          # and grepping for the unresolved path finds nothing even though the
+          # mount succeeded, which is exactly how this failed the first time.
+          # Resolving after mounting would cd into the mount itself.
+          mnt="$(cd "$work/mnt" && pwd -P)"
+          echo "mount point resolves to $mnt"
+
+          ./juicefs nfsmount --no-usage-report "badger://$work/meta" "$mnt" \
             > "$work/nfs.log" 2>&1 &
           srv=$!
+          # Leave nothing mounted behind on any exit path, successful or not: a
+          # stranded NFS mount makes every later step in the job hang.
+          trap 'kill -TERM "$srv" 2>/dev/null || true; sleep 2; umount "$mnt" 2>/dev/null || true' EXIT
 
           # mount_nfs returns before the mount is necessarily visible, and a
           # fixed sleep here would be a flake either way it was wrong.
           for i in $(seq 1 60); do
-            if mount | grep -q " on $work/mnt "; then break; fi
+            if mount | grep -q " on $mnt "; then break; fi
             if ! kill -0 "$srv" 2>/dev/null; then
               echo "::error::the server exited before the mount appeared"
               cat "$work/nfs.log"
@@ -150,10 +162,11 @@ jobs:
             sleep 1
           done
 
-          mnt_line=$(mount | grep " on $work/mnt " || true)
+          mnt_line=$(mount | grep " on $mnt " || true)
           if [ -z "$mnt_line" ]; then
-            echo "::error::no mount at $work/mnt after 60s"
-            cat "$work/nfs.log"
+            echo "::error::no mount at $mnt after 60s"
+            echo "--- mount table ---"; mount
+            echo "--- server log ---"; cat "$work/nfs.log"
             exit 1
           fi
           echo "$mnt_line"
@@ -164,25 +177,25 @@ jobs:
           # A real read/write round trip through the kernel's NFS client,
           # large enough to span many RPCs at wsize=1M.
           dd if=/dev/urandom of="$work/src.bin" bs=1m count=64
-          cp "$work/src.bin" "$work/mnt/data.bin"
-          cmp "$work/src.bin" "$work/mnt/data.bin"
+          cp "$work/src.bin" "$mnt/data.bin"
+          cmp "$work/src.bin" "$mnt/data.bin"
 
           # Metadata operations, and read back what another process wrote.
-          mkdir "$work/mnt/dir"
-          echo "written through the kernel NFS client" > "$work/mnt/dir/note"
-          ls -la "$work/mnt" "$work/mnt/dir"
-          grep -q "kernel NFS client" "$work/mnt/dir/note"
-          rm "$work/mnt/dir/note"
-          test ! -e "$work/mnt/dir/note"
+          mkdir "$mnt/dir"
+          echo "written through the kernel NFS client" > "$mnt/dir/note"
+          ls -la "$mnt" "$mnt/dir"
+          grep -q "kernel NFS client" "$mnt/dir/note"
+          rm "$mnt/dir/note"
+          test ! -e "$mnt/dir/note"
 
           # Shut down through the signal path, which is what unmounts and
           # flushes; then prove the mount is gone.
           kill -TERM "$srv"
           for i in $(seq 1 30); do
-            if ! mount | grep -q " on $work/mnt "; then break; fi
+            if ! mount | grep -q " on $mnt "; then break; fi
             sleep 1
           done
-          if mount | grep -q " on $work/mnt "; then
+          if mount | grep -q " on $mnt "; then
             echo "::error::still mounted after SIGTERM"
             exit 1
           fi
