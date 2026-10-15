@@ -1,4 +1,4 @@
-# Builds the linux binaries Union ships and attaches them to a v*-union.* tag.
+# Builds the binaries Union ships and attaches them to a v*-union.* tag.
 #
 # Replaces the hand-run `go build` the union.1/union.2 releases were cut with
 # (see UNION-DELTA.md "Releases"), which is why those tags carry a linux-amd64
@@ -11,7 +11,13 @@
 # Native runners per arch rather than cross-compilation: the build needs
 # CGO_ENABLED=1 (go-sqlite3 — `nosqlite` is deliberately NOT in the tag list
 # below), and a native aarch64 toolchain avoids maintaining a cross-gcc setup.
-# GitHub's arm64 runners are free for public repos, which this fork is.
+# GitHub's arm64 and macOS runners are free for public repos, which this fork is.
+#
+# darwin matters for the same reason arm64 did: without a fork asset for a
+# platform, bundle_juicefs.py falls back to upstream juicefs, which has neither
+# badger nor passthrough — so a Mac could not open a volume created by the
+# default metadata store at all. A darwin cross-compile is not an option,
+# because cgo to darwin needs the macOS SDK.
 name: union release
 
 on:
@@ -45,6 +51,10 @@ jobs:
             runner: ubuntu-22.04
           - platform: linux-arm64
             runner: ubuntu-22.04-arm
+          - platform: darwin-arm64
+            runner: macos-15
+          - platform: darwin-amd64
+            runner: macos-15-intel
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -99,6 +109,11 @@ jobs:
             # an arm64 asset name, invisible until someone runs it.
             linux-amd64) echo "$info" | grep "x86-64" > /dev/null ;;
             linux-arm64) echo "$info" | grep "aarch64" > /dev/null ;;
+            # `file` on a Mach-O binary reports e.g.
+            # "Mach-O 64-bit executable arm64", so assert both the format and
+            # the arch — an ELF under a darwin asset name would otherwise ship.
+            darwin-arm64) echo "$info" | grep "Mach-O" > /dev/null && echo "$info" | grep "arm64" > /dev/null ;;
+            darwin-amd64) echo "$info" | grep "Mach-O" > /dev/null && echo "$info" | grep "x86_64" > /dev/null ;;
           esac
 
           # pkg/version has no ldflag-settable version string (it is a struct
@@ -127,7 +142,14 @@ jobs:
         run: |
           set -euo pipefail
           tar -czf "juicefs-${{ steps.v.outputs.version }}-${{ matrix.platform }}.tar.gz" juicefs
-          sha256sum "juicefs-${{ steps.v.outputs.version }}-${{ matrix.platform }}.tar.gz"
+          # macOS has shasum, not sha256sum, and this step runs on both now.
+          # Without the fallback the darwin jobs would fail here, AFTER a
+          # successful build and verify, which is a confusing place to stop.
+          if command -v sha256sum > /dev/null; then
+            sha256sum "juicefs-${{ steps.v.outputs.version }}-${{ matrix.platform }}.tar.gz"
+          else
+            shasum -a 256 "juicefs-${{ steps.v.outputs.version }}-${{ matrix.platform }}.tar.gz"
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
