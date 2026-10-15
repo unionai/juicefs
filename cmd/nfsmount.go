@@ -24,7 +24,9 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -242,26 +244,86 @@ func runMount(mountPoint string, port, attrTimeoutMs int, readOnly bool) error {
 	}
 }
 
-func runUnmount(mountPoint string) error {
-	var cmd *exec.Cmd
-	switch runtime.GOOS {
-	case "darwin":
-		cmd = exec.Command("umount", mountPoint)
-	default:
-		if os.Geteuid() == 0 {
-			cmd = exec.Command("umount", mountPoint)
-		} else {
-			cmd = exec.Command("sudo", "-n", "umount", mountPoint)
+// unmountAttempts is the escalation, gentlest first. A mount with I/O still in
+// flight returns EBUSY for a moment, so the plain command is retried before
+// anything heavier is tried.
+func unmountAttempts(mountPoint string) [][]string {
+	if runtime.GOOS == "darwin" {
+		return [][]string{
+			{"umount", mountPoint},
+			// What macOS itself suggests when umount reports "Resource busy".
+			{"diskutil", "unmount", mountPoint},
+			{"umount", "-f", mountPoint},
 		}
 	}
-	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
-	// A mount with I/O still in flight can refuse to go; one retry covers the
-	// common case without turning shutdown into an indefinite wait.
-	if err := cmd.Run(); err != nil {
-		time.Sleep(time.Second)
+	privileged := func(argv ...string) []string {
+		if os.Geteuid() == 0 {
+			return argv
+		}
 
-		return cmd.Run()
+		return append([]string{"sudo", "-n"}, argv...)
 	}
 
-	return nil
+	return [][]string{
+		privileged("umount", mountPoint),
+		privileged("umount", "-f", mountPoint),
+	}
+}
+
+func runUnmount(mountPoint string) error {
+	// A FRESH exec.Cmd per attempt. An earlier version called cmd.Run() and
+	// then, on failure, `return cmd.Run()` on the same value — which Go refuses
+	// with "exec: already started", so the retry never ran at all. On a real
+	// Mac that turned a transient "Resource busy" into a mount left behind, and
+	// the only trace was a one-line warning about the exec rather than about
+	// the unmount.
+	var last error
+	delays := []time.Duration{0, 500 * time.Millisecond, time.Second, 2 * time.Second, 4 * time.Second}
+	for i, delay := range delays {
+		if delay > 0 {
+			time.Sleep(delay)
+		}
+		// Already gone — by an earlier attempt that reported failure, or by
+		// whatever was holding it letting go.
+		if !isMounted(mountPoint) {
+			return nil
+		}
+		// Escalate only once the gentle command has had a few goes: -f and
+		// diskutil can disrupt a writer that was about to finish on its own.
+		attempts := unmountAttempts(mountPoint)
+		argv := attempts[0]
+		if i >= len(delays)-len(attempts)+1 {
+			argv = attempts[min(i-(len(delays)-len(attempts)), len(attempts)-1)]
+		}
+		cmd := exec.Command(argv[0], argv[1:]...) // #nosec G204 - fixed argv
+		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+		if err := cmd.Run(); err == nil {
+			return nil
+		} else {
+			last = err
+		}
+	}
+	if !isMounted(mountPoint) {
+		return nil
+	}
+
+	return fmt.Errorf("could not unmount %s: %w", mountPoint, last)
+}
+
+// isMounted is deliberately cheap and tolerant: it answers "is there still
+// something mounted here", and a wrong "yes" only costs another attempt.
+func isMounted(mountPoint string) bool {
+	target, err := filepath.EvalSymlinks(mountPoint)
+	if err != nil {
+		target = mountPoint
+	}
+	out, err := exec.Command("/sbin/mount").Output() // #nosec G204 - fixed path
+	if err != nil {
+		out, err = exec.Command("mount").Output() // #nosec G204 - fixed argv
+		if err != nil {
+			return true
+		}
+	}
+
+	return strings.Contains(string(out), " on "+target+" ")
 }
