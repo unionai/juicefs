@@ -350,11 +350,7 @@ require (
 
 replace github.com/minio/minio v0.0.0-20210206053228-97fe57bba92c => github.com/juicedata/minio v0.0.0-20260915033819-47296b1b89b0
 
-// TEMPORARY, do not merge: unionai/go-fuse#6 moves _MINOR_VERSION_INIT_EXT
-// out of request_linux.go, without which this package does not compile for
-// darwin at all. Revert this line to the union-branch pseudo-version once #6
-// has merged.
-replace github.com/hanwen/go-fuse/v2 => github.com/unionai/go-fuse/v2 v2.1.2-union.3.0.20261014164628-2783b0a3479f
+replace github.com/hanwen/go-fuse/v2 => github.com/unionai/go-fuse/v2 v2.1.2-union.3.0.20261015213751-0c8985f121de
 
 replace github.com/dgrijalva/jwt-go v3.2.0+incompatible => github.com/golang-jwt/jwt v3.2.1+incompatible
 

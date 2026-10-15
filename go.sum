@@ -805,6 +805,8 @@ github.com/unionai/go-fuse/v2 v2.1.2-union.3.0.20260929140957-de43f506ee85 h1:/y
 github.com/unionai/go-fuse/v2 v2.1.2-union.3.0.20260929140957-de43f506ee85/go.mod h1:xKwi1cF7nXAOBCXujD5ie0ZKsxc8GGSA1rlMJc+8IJs=
 github.com/unionai/go-fuse/v2 v2.1.2-union.3.0.20261014164628-2783b0a3479f h1:8YDkChxlZLWAPjtmGvnFBynQOrrHYo0O+RzaCTauAxc=
 github.com/unionai/go-fuse/v2 v2.1.2-union.3.0.20261014164628-2783b0a3479f/go.mod h1:xKwi1cF7nXAOBCXujD5ie0ZKsxc8GGSA1rlMJc+8IJs=
+github.com/unionai/go-fuse/v2 v2.1.2-union.3.0.20261015213751-0c8985f121de h1:j31EMlD1CduhHHczH4CaoMu5z0O0y1qkZ3u+qVRif1Q=
+github.com/unionai/go-fuse/v2 v2.1.2-union.3.0.20261015213751-0c8985f121de/go.mod h1:xKwi1cF7nXAOBCXujD5ie0ZKsxc8GGSA1rlMJc+8IJs=
 github.com/valyala/bytebufferpool v1.0.0 h1:GqA5TC/0021Y/b9FG4Oi9Mr3q7XYx6KllzawFIhcdPw=
 github.com/valyala/bytebufferpool v1.0.0/go.mod h1:6bBcMArwyJ5K/AmCkWv1jt77kVWyCJ6HpOuEn7z0Csc=
 github.com/valyala/fasthttp v1.67.0 h1:tqKlJMUP6iuNG8hGjK/s9J4kadH7HLV4ijEcPGsezac=
