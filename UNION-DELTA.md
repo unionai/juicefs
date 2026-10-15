@@ -28,15 +28,28 @@ Branch layout:
 | Store archives: directory-shaped engines checkpoint to a tar of the store directory instead of a logical dump | `haytham/badger-dir-checkpoint` | candidate — pairs with the checkpoint verbs; the win (no replay on restore) is generic to BadgerDB |
 | `--slice-domain` (partition slice IDs per writer session) | `haytham/domain-scoped-slices` | union-only — encodes Union's volume fork/branch model |
 | `slice-refs` (GC reference extraction from commit indexes) | `haytham/slice-refs` | union-only — serves Union's GC reaper design |
+| `nfsmount` (serve a volume over NFSv3 on loopback, mount it with the OS's NFS client, no FUSE) | `union` only | candidate — generically useful on macOS, where mounting otherwise needs macFUSE; pitch once it has run in anger |
 | `go.mod`: replace go-fuse with `github.com/unionai/go-fuse/v2` release tags | `union` only | n/a (fork plumbing; upstream PR #7202 carries its own replace pointing at go-fuse#53) |
 
 ## Releases
 
-Tags `v1.4.0-union.N` are cut from `union`. Pushing such a tag runs
-`.github/workflows/union-release.yml`, which builds **linux-amd64 and
-linux-arm64** on native runners and attaches
+Tags `v1.4.0-union.N` and `v1.5.0-union.N` are cut from `union`. Pushing such a
+tag runs `.github/workflows/union-release.yml`, which builds **linux-amd64,
+linux-arm64, darwin-arm64 and darwin-amd64** on native runners and attaches
 `juicefs-<version>-<platform>.tar.gz` to the release. (`workflow_dispatch`
-rebuilds an existing tag.) The build is:
+rebuilds an existing tag.)
+
+Native runners rather than cross-compilation because the build needs
+`CGO_ENABLED=1` (go-sqlite3; `nosqlite` is deliberately absent from the tag
+list below), and a cgo cross-compile to darwin would need the macOS SDK.
+GitHub's arm64 and macOS runners are free for public repos, which this fork is.
+
+Every platform Union ships a wheel for needs an asset here. Where one is
+missing, `bundle_juicefs.py` falls back to upstream juicefs — which has neither
+badger nor passthrough — so that platform silently cannot open a volume created
+with the default metadata store. That is why darwin was added in #49.
+
+The build is:
 
 ```
 CGO_ENABLED=1 go build -tags nogateway,nowebdav,nocos,nobos,nohdfs,noibmcos,noobs,nooss,noqingstor,nosftp,noswift,noufile,nob2,nonfs,nodragonfly,nomysql,nopg,notikv,noetcd,nocifs,nostorj,noqiniu,notos,noks3
