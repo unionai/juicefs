@@ -24,18 +24,9 @@ import (
 	"errors"
 	_ "net/http/pprof"
 	"os"
-	"os/signal"
 	"path"
 	"strconv"
 	"strings"
-	"syscall"
-
-	"github.com/juicedata/juicefs/pkg/chunk"
-	"github.com/juicedata/juicefs/pkg/fs"
-	"github.com/juicedata/juicefs/pkg/meta"
-	"github.com/juicedata/juicefs/pkg/object"
-	"github.com/juicedata/juicefs/pkg/utils"
-	"github.com/juicedata/juicefs/pkg/vfs"
 
 	jfsgateway "github.com/juicedata/juicefs/pkg/gateway"
 	"github.com/urfave/cli/v2"
@@ -241,72 +232,4 @@ var jfsGateway minio.ObjectLayer
 func gateway2(ctx *mcli.Context) error {
 	minio.ServerMainForJFS(ctx, jfsGateway)
 	return nil
-}
-
-func initForSvc(c *cli.Context, mp string, svcType, metaUrl, listenAddr string) (*vfs.Config, *fs.FileSystem) {
-	removePassword(metaUrl)
-	metaConf := getMetaConf(c, mp, c.Bool("read-only"))
-	metaCli := meta.NewClient(metaUrl, metaConf)
-	if c.Bool("background") {
-		if err := makeDaemonForSvc(c, metaCli, metaUrl, listenAddr); err != nil {
-			logger.Fatalf("make daemon: %s", err)
-		}
-	}
-
-	format, err := metaCli.Load(true)
-	if err != nil {
-		logger.Fatalf("load setting: %s", err)
-	}
-	if st := metaCli.Chroot(meta.Background(), metaConf.Subdir); st != 0 {
-		logger.Fatalf("Chroot to %q: %s", metaConf.Subdir, st)
-	}
-	registerer, registry := wrapRegister(c, svcType, format.Name)
-
-	blob, err := NewReloadableStorage(format, metaCli, updateFormat(c))
-	if err != nil {
-		logger.Fatalf("object storage: %s", err)
-	}
-	logger.Infof("Data use %s", blob)
-
-	chunkConf := getChunkConf(c, format)
-	store := chunk.NewCachedStore(blob, *chunkConf, registerer)
-	registerMetaMsg(metaCli, store, chunkConf)
-
-	err = metaCli.NewSession(true)
-	if err != nil {
-		logger.Fatalf("new session: %s", err)
-	}
-	metaCli.OnReload(func(fmt *meta.Format) {
-		updateFormat(c)(fmt)
-		store.UpdateLimit(fmt.UploadLimit, fmt.DownloadLimit)
-	})
-
-	// Go will catch all the signals
-	signal.Ignore(syscall.SIGPIPE)
-	signalChan := make(chan os.Signal, 1)
-	signal.Notify(signalChan, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
-	go func() {
-		sig := <-signalChan
-		logger.Infof("Received signal %s, exiting...", sig.String())
-		if err := metaCli.CloseSession(); err != nil {
-			logger.Fatalf("close session failed: %s", err)
-		}
-		object.Shutdown(blob)
-		os.Exit(0)
-	}()
-	vfsConf := getVfsConf(c, metaConf, format, chunkConf)
-	vfsConf.AccessLog = c.String("access-log")
-	vfsConf.AttrTimeout = utils.Duration(c.String("attr-cache"))
-	vfsConf.EntryTimeout = utils.Duration(c.String("entry-cache"))
-	vfsConf.DirEntryTimeout = utils.Duration(c.String("dir-entry-cache"))
-	vfsConf.Mountpoint = mp
-
-	initBackgroundTasks(c, vfsConf, metaConf, metaCli, blob, registerer, registry)
-	jfs, err := fs.NewFileSystem(vfsConf, metaCli, store, registry)
-	if err != nil {
-		logger.Fatalf("Initialize failed: %s", err)
-	}
-	jfs.InitMetrics(registerer)
-
-	return vfsConf, jfs
 }
