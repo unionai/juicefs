@@ -554,6 +554,7 @@ func newBadgerClient(addr string) (tkvClient, error) {
 	}
 	opt.Logger = utils.GetLogger("badger")
 	opt.MetricsEnabled = false
+	opt = boundBadgerMemory(opt)
 	client, err := badger.Open(opt)
 	if err != nil {
 		return nil, err
@@ -582,4 +583,38 @@ func newBadgerClient(addr string) (tkvClient, error) {
 func init() {
 	Register("badger", newKVMeta)
 	drivers["badger"] = newBadgerClient
+}
+
+// boundBadgerMemory caps what Badger can hold at once inside a mount client.
+//
+// Badger's defaults are sized for a dedicated database server. In a client
+// that serves a block-mode home, a burst of metadata writes (an fstrim punches
+// a hole per freed range, and each punch rewrites its chunk's whole slice
+// value) fills memtables fast and sets off L0->Lmax compactions on all four
+// compactors at once. Every table a compaction builds allocates 2x its target
+// size up front (table.NewTableBuilder), up to 8+splits builders in flight per
+// compaction, and the target grows by TableSizeMultiplier per level: a heap
+// profile of a live client mid-trim had 81% of its heap in those builders
+// (z.Calloc via compactBuildTables / flushMemtable), and the hourly trim took
+// agent pods from ~1.4 GB to 10 GB and into an OOM kill. None of that is
+// garbage, so GOMEMLIMIT cannot help.
+//
+// Bounded: two compactors (Badger's minimum), every level's tables at the base
+// size (so a builder holds ~4 MiB, not 2x a deep level's), smaller and fewer
+// memtables, and a smaller block cache. More, smaller SSTs is the price; the
+// store of one volume stays far below where that matters.
+//
+// JFS_BADGER_MEMORY=default keeps Badger's own defaults (for comparison).
+func boundBadgerMemory(opt badger.Options) badger.Options {
+	if strings.EqualFold(os.Getenv("JFS_BADGER_MEMORY"), "default") {
+		return opt
+	}
+	opt.NumCompactors = 2
+	opt.TableSizeMultiplier = 1
+	opt.MemTableSize = 32 << 20
+	opt.NumMemtables = 3
+	opt.NumLevelZeroTables = 3
+	opt.NumLevelZeroTablesStall = 10
+	opt.BlockCacheSize = 64 << 20
+	return opt
 }
