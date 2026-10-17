@@ -827,7 +827,14 @@ func (r *dataReader) readSlice(ctx context.Context, s *meta.Slice, page *chunk.P
 		n, err := reader.ReadAt(ctx, p, off+int(s.Off))
 		p.Release()
 		if n == 0 && err != nil {
-			logger.Warningf("fail to read sliceId %d (off:%d, size:%d, clen: %d, inode: %d): %s",
+			// A canceled read is a read-ahead nothing needs any more, not a
+			// failure: it floods the log right after a mount (ext4 reading its
+			// journal through the block image) and reads as data loss.
+			logf := logger.Warningf
+			if utils.IsCanceled(err) {
+				logf = logger.Debugf
+			}
+			logf("fail to read sliceId %d (off:%d, size:%d, clen: %d, inode: %d): %s",
 				s.Id, off+int(s.Off), len(buf)-read, s.Size, ctx.Value(meta.CtxKey("inode")), err)
 			return err
 		}

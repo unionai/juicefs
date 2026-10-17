@@ -2946,7 +2946,10 @@ func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool, tierID
 	}
 	err := m.newMsg(CompactChunk, slices, id, uint8(tierID))
 	if err != nil {
-		if !strings.Contains(err.Error(), "not exist") && !strings.Contains(err.Error(), "not found") {
+		if utils.IsCanceled(err) {
+			// Stopped with its mount or its caller; the next compaction redoes it.
+			logger.Debugf("compact %d %d with %d slices: %s", inode, indx, len(compacted), err)
+		} else if !strings.Contains(err.Error(), "not exist") && !strings.Contains(err.Error(), "not found") {
 			logger.Warnf("compact %d %d with %d slices: %s", inode, indx, len(compacted), err)
 		}
 		return
