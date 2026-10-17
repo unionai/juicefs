@@ -68,6 +68,22 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # Module downloads have failed mid-transfer on the macOS runners
+      # ("connection reset by peer" from proxy.golang.org, 2026-10-17). `|`
+      # makes Go try the next source on ANY error, not only a 404; the retry
+      # absorbs a reset that hits every source at once. Fetched up front so
+      # the build step never touches the network.
+      - name: Download modules (retried)
+        env:
+          GOPROXY: https://proxy.golang.org|https://goproxy.io|direct
+        run: |
+          for i in 1 2 3; do
+            go mod download && exit 0
+            echo "go mod download failed (attempt $i); retrying in $((i * 20))s"
+            sleep $((i * 20))
+          done
+          exit 1
+
       - name: Resolve version
         id: v
         run: |
